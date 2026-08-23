@@ -25,11 +25,13 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            observe_unaddressed_messages: false  # context-only; never dispatches the agent
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_REQUIRE_MENTION,
+    BUZZ_ACCEPT_BARE_SLASH_COMMANDS, BUZZ_OBSERVE_UNADDRESSED_MESSAGES
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -392,6 +394,32 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # A bare `/command` can be reserved for one primary agent (Nabu) while
+        # specialist agents still require explicit `@name /command`
+        # addressing. Disabled by default so existing multi-agent gateways do
+        # not all consume the same unaddressed command.
+        _bare_slash_raw = os.getenv("BUZZ_ACCEPT_BARE_SLASH_COMMANDS")
+        if _bare_slash_raw is None:
+            _bare_slash_cfg = extra.get("accept_bare_slash_commands", False)
+        else:
+            _bare_slash_cfg = _bare_slash_raw
+        self.accept_bare_slash_commands = str(_bare_slash_cfg).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
+
+        # Preserve unaddressed channel/forum traffic as context in the
+        # canonical thread session without running the agent or sending a
+        # response. This lets a primary coordinator see direct specialist
+        # instructions and results when it is addressed later in that thread.
+        _observe_raw = os.getenv("BUZZ_OBSERVE_UNADDRESSED_MESSAGES")
+        if _observe_raw is None:
+            _observe_cfg = extra.get("observe_unaddressed_messages", False)
+        else:
+            _observe_cfg = _observe_raw
+        self.observe_unaddressed_messages = str(_observe_cfg).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -609,7 +637,12 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # Buzz threads are one-level conversations. Gateway callers commonly
+        # pass the triggering message as ``reply_to`` while ``thread_id`` is
+        # the canonical outer NIP-10 root. Prefer that root so a follow-up
+        # response never creates reply-in-reply depth. DMs carry no thread id
+        # and therefore retain their ordinary reply anchor.
+        reply_target = (metadata or {}).get("thread_id") or reply_to
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -884,7 +917,26 @@ class BuzzAdapter(BasePlatformAdapter):
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
                             elif message[0] == "CLOSED":
+                                subscription_id = str(message[1]) if len(message) > 1 else ""
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
+                                channel_id = subscriptions.pop(subscription_id, None)
+                                if channel_id:
+                                    # One stale or revoked channel must not tear
+                                    # down every healthy subscription. Drop it
+                                    # for this adapter lifetime; a membership
+                                    # event can discover it again after access
+                                    # is restored.
+                                    self._channel_state.pop(channel_id, None)
+                                    logger.warning(
+                                        "Buzz: channel subscription %s closed; disabling %s: %s",
+                                        subscription_id,
+                                        channel_id,
+                                        detail,
+                                    )
+                                    continue
+                                if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+                                    logger.warning("Buzz: membership subscription closed: %s", detail)
+                                    continue
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
@@ -1033,8 +1085,23 @@ class BuzzAdapter(BasePlatformAdapter):
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
-            return
+        if not is_dm:
+            is_home_channel = bool(self.home_channel) and channel_id == self.home_channel
+            is_bare_slash = content.lstrip().startswith("/")
+            implicitly_addressed = (
+                is_home_channel
+                or (self.accept_bare_slash_commands and is_bare_slash)
+            )
+            if self.require_mention and not implicitly_addressed and not self._is_mentioned(content):
+                if self.observe_unaddressed_messages:
+                    await self._observe_unaddressed_message(
+                        channel_id=channel_id,
+                        pubkey=pubkey,
+                        content=content,
+                        event=event,
+                        created_at=created_at,
+                    )
+                return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
@@ -1047,6 +1114,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        thread_id = None if is_dm else self._thread_root_id(event)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1056,7 +1124,88 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=thread_id,
+            raw_event=event,
         )
+
+    @staticmethod
+    def _thread_root_id(event: dict) -> str:
+        """Return one stable Buzz conversation id from NIP-10 tags.
+
+        A top-level message starts a fresh conversation and therefore keys on
+        its own event id. Direct replies may carry only a reply marker; nested
+        replies carry explicit root + reply markers. The outer root always
+        wins, so replying to a reply continues the existing Hermes session.
+        """
+        tags = event.get("tags")
+        if isinstance(tags, list):
+            for tag in tags:
+                if (
+                    isinstance(tag, (list, tuple))
+                    and len(tag) > 3
+                    and tag[0] == "e"
+                    and tag[3] == "root"
+                    and tag[1]
+                ):
+                    return str(tag[1])
+            for tag in tags:
+                if (
+                    isinstance(tag, (list, tuple))
+                    and len(tag) > 1
+                    and tag[0] == "e"
+                    and tag[1]
+                ):
+                    return str(tag[1])
+        return str(event.get("id") or "")
+
+    async def _observe_unaddressed_message(
+        self,
+        *,
+        channel_id: str,
+        pubkey: str,
+        content: str,
+        event: dict,
+        created_at: int,
+    ) -> None:
+        """Append context-only Buzz traffic to its canonical thread session."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            user_name = await self._resolve_user_name(pubkey)
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_name=self._channel_names.get(channel_id, channel_id),
+                chat_type="group",
+                user_id=pubkey,
+                user_name=user_name,
+                thread_id=self._thread_root_id(event),
+                message_id=str(event.get("id") or ""),
+            )
+            session_entry = store.get_or_create_session(source)
+            attributed = f"[{user_name or pubkey}|{pubkey}]\n{content}"
+            timestamp = (
+                datetime.fromtimestamp(created_at).isoformat()
+                if created_at
+                else datetime.now().isoformat()
+            )
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": attributed,
+                    "timestamp": timestamp,
+                    "message_id": str(event.get("id") or ""),
+                    "observed": True,
+                },
+            )
+            logger.info(
+                "Buzz: observed unaddressed thread context in %s from %s…",
+                channel_id,
+                pubkey[:8],
+            )
+        except Exception as exc:
+            logger.warning("Buzz: failed to observe unaddressed message: %s", exc)
 
     # ── DM classification (issue #68871) ──────────────────────────────────
     #
@@ -1144,7 +1293,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?!\w)"
             if re.search(pattern, lowered):
                 return True
         return False
@@ -1219,6 +1368,8 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        raw_event: Optional[dict] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,14 +1381,25 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
+            message_id=message_id,
         )
 
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
+            raw_message=raw_event,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            channel_prompt=(
+                "You are handling an addressed Buzz message. Earlier Buzz messages may be "
+                "provided as observed context-only history. They can describe direct work "
+                "with specialist agents, but were not requests to you. Treat only the current "
+                "new message as addressed to you and use observed context when relevant."
+                if chat_type == "group" and self.observe_unaddressed_messages
+                else None
+            ),
         )
 
         await self.handle_message(event)
@@ -1316,6 +1478,18 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if "accept_bare_slash_commands" in extra and not os.getenv(
+        "BUZZ_ACCEPT_BARE_SLASH_COMMANDS"
+    ):
+        os.environ["BUZZ_ACCEPT_BARE_SLASH_COMMANDS"] = str(
+            extra["accept_bare_slash_commands"]
+        ).lower()
+    if "observe_unaddressed_messages" in extra and not os.getenv(
+        "BUZZ_OBSERVE_UNADDRESSED_MESSAGES"
+    ):
+        os.environ["BUZZ_OBSERVE_UNADDRESSED_MESSAGES"] = str(
+            extra["observe_unaddressed_messages"]
+        ).lower()
     return None
 
 

@@ -42,6 +42,9 @@ _ENV_VARS = (
     "BUZZ_HOME_CHANNEL",
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
+    "BUZZ_REQUIRE_MENTION",
+    "BUZZ_ACCEPT_BARE_SLASH_COMMANDS",
+    "BUZZ_OBSERVE_UNADDRESSED_MESSAGES",
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
@@ -128,6 +131,9 @@ class TestBuzzAdapterInit:
                 "channels": ["ccc"],
                 "poll_interval": 2,
                 "home_channel": "ccc",
+                "require_mention": True,
+                "accept_bare_slash_commands": True,
+                "observe_unaddressed_messages": True,
             },
         )
         adapter = BuzzAdapter(cfg)
@@ -135,6 +141,9 @@ class TestBuzzAdapterInit:
         assert adapter.channels == ["ccc"]
         assert adapter.poll_interval == 2.0
         assert adapter.home_channel == "ccc"
+        assert adapter.require_mention is True
+        assert adapter.accept_bare_slash_commands is True
+        assert adapter.observe_unaddressed_messages is True
 
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
@@ -239,9 +248,57 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_unaddressed_specialist_message_is_observed_without_dispatch(self, adapter):
+        adapter.observe_unaddressed_messages = True
+        adapter._resolve_user_name = AsyncMock(return_value="Helper Bot")
+        store = MagicMock()
+        store.get_or_create_session.return_value.session_id = "session-root"
+        adapter.set_session_store(store)
+        event = _event("nested", content="@OtherAgent /status", created_at=10)
+        event["tags"].extend(
+            [
+                ["e", "outer-root", "", "root"],
+                ["e", "parent-reply", "", "reply"],
+            ]
+        )
+
+        await self._poll_with(adapter, event)
+
+        assert adapter._dispatched == []
+        source = store.get_or_create_session.call_args.args[0]
+        assert source.thread_id == "outer-root"
+        store.append_to_transcript.assert_called_once()
+        transcript = store.append_to_transcript.call_args.args[1]
+        assert transcript["observed"] is True
+        assert transcript["message_id"] == "nested"
+        assert transcript["content"].endswith("@OtherAgent /status")
+
+    @pytest.mark.asyncio
     async def test_name_mention_dispatched(self, adapter):
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_plain_name_is_not_a_mention(self, adapter):
+        await self._poll_with(adapter, _event("e1", content="Chip can help with this", created_at=10))
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_home_channel_does_not_require_a_mention(self, adapter):
+        adapter.home_channel = CHANNEL
+        await self._poll_with(adapter, _event("e1", content="pick this up", created_at=10))
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_bare_slash_is_ignored_without_primary_agent_opt_in(self, adapter):
+        await self._poll_with(adapter, _event("e1", content="/status", created_at=10))
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_bare_slash_dispatches_for_opted_in_primary_agent(self, adapter):
+        adapter.accept_bare_slash_commands = True
+        await self._poll_with(adapter, _event("e1", content="/status", created_at=10))
+        assert [d["text"] for d in adapter._dispatched] == ["/status"]
 
 
     @pytest.mark.asyncio
@@ -381,6 +438,59 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+# ── Thread-to-session routing ─────────────────────────────────────────────
+
+
+class TestThreadRouting:
+
+    def test_top_level_message_starts_session_at_own_event_id(self):
+        assert BuzzAdapter._thread_root_id(_event("root")) == "root"
+
+    def test_direct_reply_continues_root_session(self):
+        event = _event("reply")
+        event["tags"].append(["e", "root", "", "reply"])
+        assert BuzzAdapter._thread_root_id(event) == "root"
+
+    def test_nested_reply_prefers_outer_root_marker(self):
+        event = _event("nested")
+        event["tags"].extend(
+            [
+                ["e", "root", "", "root"],
+                ["e", "reply", "", "reply"],
+            ]
+        )
+        assert BuzzAdapter._thread_root_id(event) == "root"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_carries_stable_thread_and_message_anchor(self):
+        adapter = _make_adapter({"home_channel": CHANNEL})
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        captured = []
+
+        async def capture(**kwargs):
+            captured.append(kwargs)
+
+        adapter._dispatch_message = capture
+        nested = _event("nested", content="continue", created_at=10)
+        nested["tags"].extend(
+            [
+                ["e", "root", "", "root"],
+                ["e", "reply", "", "reply"],
+            ]
+        )
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], nested)
+
+        assert captured[0]["thread_id"] == "root"
+        assert captured[0]["message_id"] == "nested"
+        assert captured[0]["raw_event"] == nested
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
@@ -406,6 +516,40 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_thread_root_wins_over_nested_reply_anchor(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124"})
+        adapter._run_cli = cli
+
+        await adapter.send(
+            CHANNEL,
+            "flat response",
+            reply_to="nested-user-reply",
+            metadata={"thread_id": "outer-root"},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "outer-root"
+
+    @pytest.mark.asyncio
+    async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt125"})
+        adapter._run_cli = cli
+
+        await adapter.send(
+            CHANNEL,
+            "dm response",
+            reply_to="dm-message",
+            metadata=None,
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "dm-message"
 
 
     @pytest.mark.asyncio
@@ -536,5 +680,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-
