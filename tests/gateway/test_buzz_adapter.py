@@ -331,6 +331,27 @@ class TestMentionGating:
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
 
     @pytest.mark.asyncio
+    async def test_home_channel_observes_specialist_result_without_dispatch(self, adapter):
+        adapter.home_channel = CHANNEL
+        adapter.observe_unaddressed_messages = True
+        adapter._allowed_pubkeys = {OTHER_PUBKEY}
+        adapter._observe_unaddressed_message = AsyncMock()
+        specialist = "b" * 64
+
+        await self._poll_with(
+            adapter,
+            _event(
+                "e1",
+                pubkey=specialist,
+                content="Specialist task completed",
+                created_at=10,
+            ),
+        )
+
+        assert adapter._dispatched == []
+        adapter._observe_unaddressed_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_bare_slash_is_ignored_without_primary_agent_opt_in(self, adapter):
         await self._poll_with(adapter, _event("e1", content="/status", created_at=10))
         assert adapter._dispatched == []
