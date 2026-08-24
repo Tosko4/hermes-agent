@@ -306,6 +306,31 @@ class TestMentionGating:
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
 
     @pytest.mark.asyncio
+    async def test_home_channel_does_not_capture_specialist_only_mention(self, adapter):
+        adapter.home_channel = CHANNEL
+        adapter.observe_unaddressed_messages = True
+        adapter._observe_unaddressed_message = AsyncMock()
+        event = _event("e1", content="@Cosmo handle this", created_at=10)
+        event["tags"].append(["p", "b" * 64])
+
+        await self._poll_with(adapter, event)
+
+        assert adapter._dispatched == []
+        adapter._observe_unaddressed_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_home_channel_dispatches_when_primary_is_one_of_the_targets(self, adapter):
+        adapter.home_channel = CHANNEL
+        event = _event("e1", content="@Chip and @Cosmo coordinate", created_at=10)
+        event["tags"].extend(
+            [["p", SELF_PUBKEY], ["p", "b" * 64]]
+        )
+
+        await self._poll_with(adapter, event)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
     async def test_bare_slash_is_ignored_without_primary_agent_opt_in(self, adapter):
         await self._poll_with(adapter, _event("e1", content="/status", created_at=10))
         assert adapter._dispatched == []

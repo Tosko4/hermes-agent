@@ -1121,8 +1121,11 @@ class BuzzAdapter(BasePlatformAdapter):
         if not is_dm:
             is_home_channel = bool(self.home_channel) and channel_id == self.home_channel
             is_bare_slash = content.lstrip().startswith("/")
+            explicitly_targeted_elsewhere = (
+                is_home_channel and self._has_foreign_only_p_targets(event)
+            )
             implicitly_addressed = (
-                is_home_channel
+                (is_home_channel and not explicitly_targeted_elsewhere)
                 or (self.accept_bare_slash_commands and is_bare_slash)
             )
             if self.require_mention and not implicitly_addressed and not self._is_mentioned(content):
@@ -1330,6 +1333,28 @@ class BuzzAdapter(BasePlatformAdapter):
             if re.search(pattern, lowered):
                 return True
         return False
+
+    def _has_foreign_only_p_targets(self, event: dict) -> bool:
+        """Whether an event explicitly targets identities other than this agent.
+
+        Buzz clients encode resolved ``@Agent`` mentions as ``p`` tags. The
+        primary agent's home channel remains mention-free for ordinary text,
+        but a resolved specialist-only mention must not be captured by that
+        convenience rule. Including this agent in the target set still counts
+        as addressed, so ``@Nabu @Cosmo`` deliberately reaches both.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        targets = {
+            str(tag[1]).strip().lower()
+            for tag in tags
+            if isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "p"
+            and str(tag[1]).strip()
+        }
+        return bool(targets) and self._self_pubkey not in targets
 
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be
