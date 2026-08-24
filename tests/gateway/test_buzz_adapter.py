@@ -648,6 +648,43 @@ class TestLiveActivity:
         assert "--session" in cli.calls[0][0]
         assert "--turn" in cli.calls[0][0]
 
+    @pytest.mark.asyncio
+    async def test_structured_activity_carries_explicit_thread_scope(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+        thread_id = "a" * 64
+
+        await adapter.publish_tool_started(
+            CHANNEL,
+            "call-thread",
+            "read_file",
+            {"path": "README.md"},
+            session_id="hermes-session",
+            turn_id="turn-thread",
+            metadata={"thread_id": thread_id},
+        )
+        args = cli.calls[0][0]
+
+        assert args[args.index("--thread") + 1] == thread_id
+        assert args[args.index("--session") + 1] == thread_id
+
+    @pytest.mark.asyncio
+    async def test_channel_root_activity_omits_thread_scope(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        await adapter.publish_tool_started(
+            CHANNEL,
+            "call-root",
+            "terminal",
+            session_id="hermes-session",
+            turn_id="turn-root",
+        )
+
+        assert "--thread" not in cli.calls[0][0]
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
