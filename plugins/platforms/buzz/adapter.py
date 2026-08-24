@@ -1142,6 +1142,20 @@ class BuzzAdapter(BasePlatformAdapter):
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+            # The primary agent's home channel is implicitly addressed, so a
+            # specialist result without a p-tag reaches this allow-list rather
+            # than the mention gate above. Preserve it as non-dispatching
+            # coordination context when observation is enabled. This mirrors
+            # unaddressed traffic outside the home channel and never grants the
+            # sender authority to invoke the agent.
+            if not is_dm and self.observe_unaddressed_messages:
+                await self._observe_unaddressed_message(
+                    channel_id=channel_id,
+                    pubkey=pubkey,
+                    content=content,
+                    event=event,
+                    created_at=created_at,
+                )
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
 
