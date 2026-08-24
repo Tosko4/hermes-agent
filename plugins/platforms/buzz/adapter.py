@@ -109,7 +109,7 @@ _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
 # Relay presence has a short Redis lease. Refresh well inside that lease so a
 # connected Hermes gateway remains visibly available on every Buzz client.
-_PRESENCE_HEARTBEAT_INTERVAL = 60.0
+_PRESENCE_HEARTBEAT_INTERVAL = 20.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -697,12 +697,17 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        # Buzz threads are one-level conversations. Gateway callers commonly
-        # pass the triggering message as ``reply_to`` while ``thread_id`` is
-        # the canonical outer NIP-10 root. Prefer that root so a follow-up
-        # response never creates reply-in-reply depth. DMs carry no thread id
-        # and therefore retain their ordinary reply anchor.
-        reply_target = (metadata or {}).get("thread_id") or reply_to
+        # Explicit Buzz threads stay one level deep and always reply to their
+        # canonical outer root. Ordinary channel turns deliberately stay
+        # top-level: the gateway still supplies the triggering message as
+        # ``reply_to``, but turning that into a NIP-10 reply would silently
+        # manufacture a thread for every prompt. DMs retain their ordinary
+        # reply anchor because they are conversations rather than channels.
+        thread_id = (metadata or {}).get("thread_id")
+        chat_type = str(
+            self._channel_state.get(str(chat_id), {}).get("chat_type") or ""
+        )
+        reply_target = thread_id or (reply_to if chat_type != "group" else None)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -725,6 +730,45 @@ class BuzzAdapter(BasePlatformAdapter):
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
             raw_response=data,
+        )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit one Buzz message for coalesced live response streaming.
+
+        Content travels over stdin so partial model output never enters the
+        process argument list. ``finalize`` and routing metadata are no-ops:
+        Buzz edits retain the target message's channel/thread relationship.
+        """
+        del chat_id, finalize, metadata
+        if not content:
+            return SendResult(success=False, error="Empty message")
+        code, out, err = await self._run_cli(
+            ["messages", "edit", "--event", str(message_id), "--content", "-"],
+            input_text=content,
+        )
+        if code != 0:
+            return SendResult(
+                success=False,
+                error=_cli_error_message(err, code),
+                retryable=code == 2,
+            )
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            data = {}
+        event_id = data.get("event_id")
+        return SendResult(
+            success=bool(data.get("accepted", True)),
+            message_id=str(message_id),
+            raw_response={**data, "edit_event_id": event_id},
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -1400,13 +1444,13 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _thread_root_id(event: dict) -> str:
+    def _thread_root_id(event: dict) -> Optional[str]:
         """Return one stable Buzz conversation id from NIP-10 tags.
 
-        A top-level message starts a fresh conversation and therefore keys on
-        its own event id. Direct replies may carry only a reply marker; nested
-        replies carry explicit root + reply markers. The outer root always
-        wins, so replying to a reply continues the existing Hermes session.
+        Top-level channel messages have no thread id and share the channel
+        session. Direct replies may carry only a reply marker; nested replies
+        carry explicit root + reply markers. The outer root always wins, so
+        every message in an explicitly created thread continues one session.
         """
         tags = event.get("tags")
         if isinstance(tags, list):
@@ -1427,7 +1471,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     and tag[1]
                 ):
                     return str(tag[1])
-        return str(event.get("id") or "")
+        return None
 
     async def _observe_unaddressed_message(
         self,

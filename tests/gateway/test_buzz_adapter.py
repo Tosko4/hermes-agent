@@ -505,8 +505,8 @@ class TestDmClassification:
 
 class TestThreadRouting:
 
-    def test_top_level_message_starts_session_at_own_event_id(self):
-        assert BuzzAdapter._thread_root_id(_event("root")) == "root"
+    def test_top_level_message_stays_in_channel_session(self):
+        assert BuzzAdapter._thread_root_id(_event("root")) is None
 
     def test_direct_reply_continues_root_session(self):
         event = _event("reply")
@@ -712,6 +712,23 @@ class TestBuzzAdapterSend:
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
     @pytest.mark.asyncio
+    async def test_top_level_group_response_does_not_create_thread(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-top"})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "top-level response", reply_to="user-message")
+
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
     async def test_thread_root_wins_over_nested_reply_anchor(self):
         adapter = _make_adapter()
         cli = _ScriptedCli()
@@ -731,6 +748,11 @@ class TestBuzzAdapterSend:
     @pytest.mark.asyncio
     async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
         adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "dm",
+            "last_ts": 0,
+            "seen": {},
+        }
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt125"})
         adapter._run_cli = cli
@@ -744,6 +766,32 @@ class TestBuzzAdapterSend:
 
         args, _stdin = cli.calls[0]
         assert args[args.index("--reply-to") + 1] == "dm-message"
+
+    @pytest.mark.asyncio
+    async def test_edit_streams_content_via_stdin(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit-1"})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(
+            CHANNEL,
+            "original-message",
+            "partial response",
+        )
+
+        assert result.success is True
+        assert result.message_id == "original-message"
+        args, stdin_text = cli.calls[0]
+        assert args == [
+            "messages",
+            "edit",
+            "--event",
+            "original-message",
+            "--content",
+            "-",
+        ]
+        assert stdin_text == "partial response"
 
 
     @pytest.mark.asyncio
