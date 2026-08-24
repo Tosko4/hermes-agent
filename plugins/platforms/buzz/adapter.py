@@ -788,12 +788,16 @@ class BuzzAdapter(BasePlatformAdapter):
             "--payload",
             "-",
         ]
-        # Buzz thread roots are the client-visible session identity. Prefer that
-        # over Hermes' internal transcript id so thread activity can be filtered
-        # consistently on Desktop and Android.
-        resolved_session = str((metadata or {}).get("thread_id") or "") or session_id
+        # Preserve Hermes' session identifier for transcript correlation while
+        # sending the Buzz thread root as its own scope. Channel-root activity
+        # deliberately omits --thread so clients never have to infer scope from
+        # an internal session id.
+        resolved_thread = str((metadata or {}).get("thread_id") or "")
+        resolved_session = resolved_thread or session_id
         if resolved_session:
             args += ["--session", resolved_session]
+        if resolved_thread:
+            args += ["--thread", resolved_thread]
         if turn_id:
             args += ["--turn", str(turn_id)]
         try:
@@ -895,6 +899,7 @@ class BuzzAdapter(BasePlatformAdapter):
             kind="turn_started",
             session_id=source.thread_id or turn_id,
             turn_id=turn_id or None,
+            metadata={"thread_id": source.thread_id} if source.thread_id else None,
             payload={"type": "turn_started"},
         )
 
@@ -916,6 +921,7 @@ class BuzzAdapter(BasePlatformAdapter):
             kind=kind,
             session_id=source.thread_id or turn_id,
             turn_id=turn_id or None,
+            metadata={"thread_id": source.thread_id} if source.thread_id else None,
             payload={"type": kind},
         )
 

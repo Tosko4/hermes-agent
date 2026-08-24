@@ -132,6 +132,19 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
+    # Buzz has a dedicated, thread-scoped activity surface for tool calls.
+    # Keep those details out of the conversation while preserving the model's
+    # natural commentary between tool iterations: that is the readable signal
+    # users need during long-running turns. Buzz messages are immutable, so
+    # token-by-token edit streaming remains off; complete commentary messages
+    # and the final answer are durable ordinary chat events.
+    "buzz": {
+        **_TIER_HIGH,
+        "tool_progress": "off",
+        "streaming": False,
+        "interim_assistant_messages": True,
+        "busy_ack_detail": False,
+    },
     # Discord has a native "subtext" primitive (-# small grey text) that reads
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
