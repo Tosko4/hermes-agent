@@ -48,7 +48,7 @@ jobs:
                 continue ;;
             esac
 
-            if echo "$email" | grep -qP '\+.*@users\.noreply\.github\.com'; then
+            if echo "$email" | grep -qE '^[0-9]+\+.+@users\.noreply\.github\.com$'; then
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
