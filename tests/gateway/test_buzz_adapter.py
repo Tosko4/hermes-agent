@@ -586,7 +586,50 @@ class TestBuzzAdapterSend:
 
 
 class TestBuzzAdapterLifecycle:
+    @pytest.mark.asyncio
+    async def test_presence_uses_cli_and_tracks_announced_state(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("users", "set-presence", {"accepted": True})
+        adapter._run_cli = cli
 
+        assert await adapter._publish_presence("online") is True
+        assert adapter._presence_announced is True
+        assert cli.calls[-1][0] == [
+            "users",
+            "set-presence",
+            "--status",
+            "online",
+        ]
+
+        assert await adapter._publish_presence("offline") is True
+        assert adapter._presence_announced is False
+        assert cli.calls[-1][0] == [
+            "users",
+            "set-presence",
+            "--status",
+            "offline",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_heartbeat_and_publishes_offline(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("users", "set-presence", {"accepted": True})
+        adapter._run_cli = cli
+        adapter._presence_announced = True
+        adapter._presence_task = asyncio.create_task(asyncio.sleep(3600))
+
+        await adapter.disconnect()
+
+        assert adapter._presence_task is None
+        assert adapter._presence_announced is False
+        assert cli.calls[-1][0] == [
+            "users",
+            "set-presence",
+            "--status",
+            "offline",
+        ]
 
     @pytest.mark.asyncio
     async def test_disconnect_releases_scoped_lock(self, monkeypatch):
