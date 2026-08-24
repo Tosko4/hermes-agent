@@ -552,6 +552,101 @@ class TestThreadRouting:
         assert captured[0]["message_id"] == "nested"
         assert captured[0]["raw_event"] == nested
 
+    @pytest.mark.asyncio
+    async def test_dispatch_auto_loads_all_skills_bound_to_channel(self):
+        adapter = _make_adapter(
+            {
+                "channel_skill_bindings": [
+                    {
+                        "id": CHANNEL,
+                        "skills": ["research", "summarize", "research"],
+                    }
+                ]
+            }
+        )
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._dispatch_message(
+            text="look into this",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Alice",
+            message_id="event-1",
+            created_at=10,
+            thread_id="root-1",
+        )
+
+        dispatched = adapter.handle_message.await_args.args[0]
+        assert dispatched.auto_skill == ["research", "summarize"]
+
+
+class TestLiveActivity:
+
+    @pytest.mark.asyncio
+    async def test_typing_heartbeat_is_thread_scoped_and_non_blocking(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        await adapter.send_typing(CHANNEL, metadata={"thread_id": "a" * 64})
+        await asyncio.gather(*adapter._typing_publish_tasks.values())
+
+        assert cli.calls == [
+            (
+                [
+                    "messages",
+                    "typing",
+                    "--channel",
+                    CHANNEL,
+                    "--thread",
+                    "a" * 64,
+                ],
+                None,
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_structured_tool_lifecycle_uses_owner_visible_activity(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        await adapter.publish_tool_started(
+            CHANNEL,
+            "call-1",
+            "terminal",
+            {"command": "cargo test"},
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        await adapter.publish_tool_completed(
+            CHANNEL,
+            "call-1",
+            "terminal",
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+
+        assert [call[0][:2] for call in cli.calls] == [
+            ["agents", "activity"],
+            ["agents", "activity"],
+        ]
+        started = json.loads(cli.calls[0][1])
+        completed = json.loads(cli.calls[1][1])
+        assert started["params"]["update"] == {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1",
+            "title": "terminal",
+            "toolName": "terminal",
+            "status": "executing",
+            "args": {"command": "cargo test"},
+        }
+        assert completed["params"]["update"]["status"] == "completed"
+        assert "--session" in cli.calls[0][0]
+        assert "--turn" in cli.calls[0][0]
 
 # ── Sending ───────────────────────────────────────────────────────────────
 

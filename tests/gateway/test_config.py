@@ -995,6 +995,28 @@ class TestLoadGatewayConfig:
             "bridged into PlatformConfig.extra by the shared-key loop"
         )
 
+    def test_buzz_bridges_multiple_channel_skills_into_adapter_extra(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  buzz:\n"
+            "    enabled: true\n"
+            "    channel_skill_bindings:\n"
+            "      - id: channel-1\n"
+            "        skills: [research, summarize]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.BUZZ].extra["channel_skill_bindings"] == [
+            {"id": "channel-1", "skills": ["research", "summarize"]}
+        ]
+
 
     def test_bridges_unauthorized_dm_behavior_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
