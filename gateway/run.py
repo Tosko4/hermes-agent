@@ -1469,22 +1469,30 @@ def _build_replay_entry(
 
 
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_BUZZ_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Buzz group context"
+_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed group context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
 
 
-def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
-    """Return True for Telegram group turns that may include observed chatter.
+def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True for gateway turns that may include observed chatter.
 
-    Telegram's observe-unmentioned mode persists skipped group chatter so a
-    later @mention can see it. Those rows must not replay as ordinary user
-    turns: a weak wake word like ``@bot cambio`` should not make the model treat
-    old unmentioned chatter as pending work. The Telegram adapter marks these
-    turns with a channel prompt; this helper keeps the run-path check explicit
-    and unit-testable.
+    Telegram and Buzz can persist skipped group chatter so a later addressed
+    message can use it as context. Those rows must not replay as ordinary user
+    turns: a weak wake word must not make the model treat old unaddressed
+    chatter as pending work. Each adapter marks these turns with a channel
+    prompt; this helper keeps the run-path check explicit and unit-testable.
     """
 
-    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+    if not channel_prompt:
+        return False
+    return any(
+        marker in channel_prompt
+        for marker in (
+            _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER,
+            _BUZZ_OBSERVED_CONTEXT_PROMPT_MARKER,
+        )
+    )
 
 
 def _csv_or_list_to_set(raw: Any) -> set[str]:
@@ -1562,7 +1570,7 @@ def _build_gateway_agent_history(
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
-    Observed Telegram group rows are returned as API-only context for the
+    Observed gateway group rows are returned as API-only context for the
     current addressed message instead of being replayed as normal prior user
     turns.  Keeping that context out of ``conversation_history`` avoids
     consecutive-user repair merging it with the live user turn and then hiding
@@ -1581,7 +1589,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -1694,7 +1702,7 @@ def _select_cached_agent_history(
 
 
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
-    """Prepend observed Telegram context to the API-only current user turn."""
+    """Prepend observed group context to the API-only current user turn."""
 
     if not observed_context:
         return message
@@ -6056,7 +6064,7 @@ class TurnRunner:
         #      - These must be passed through intact so the API sees valid
         #        assistant→tool sequences (dropping tool_calls causes 500 errors)
         #
-        # Telegram observed group context is handled structurally here:
+        # Observed group context is handled structurally here:
         # observed=True transcript rows are withheld from replayable
         # history and attached to the current addressed message as
         # API-only context, so persisted history stores only the real

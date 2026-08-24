@@ -21,6 +21,8 @@ Configuration in config.yaml::
             channels:                  # channel UUIDs to watch (empty = all joined)
               - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
+            require_mention: true       # home channel is implicitly addressed
+            accept_bare_slash_commands: false  # reserve bare slash for a primary agent
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
@@ -30,8 +32,7 @@ Configuration in config.yaml::
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS, BUZZ_REQUIRE_MENTION,
-    BUZZ_ACCEPT_BARE_SLASH_COMMANDS, BUZZ_OBSERVE_UNADDRESSED_MESSAGES
+    BUZZ_ALLOW_ALL_USERS, BUZZ_REQUIRE_MENTION
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -398,11 +399,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # specialist agents still require explicit `@name /command`
         # addressing. Disabled by default so existing multi-agent gateways do
         # not all consume the same unaddressed command.
-        _bare_slash_raw = os.getenv("BUZZ_ACCEPT_BARE_SLASH_COMMANDS")
-        if _bare_slash_raw is None:
-            _bare_slash_cfg = extra.get("accept_bare_slash_commands", False)
-        else:
-            _bare_slash_cfg = _bare_slash_raw
+        _bare_slash_cfg = extra.get("accept_bare_slash_commands", False)
         self.accept_bare_slash_commands = str(_bare_slash_cfg).strip().lower() in (
             "true", "1", "yes", "on"
         )
@@ -411,11 +408,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # canonical thread session without running the agent or sending a
         # response. This lets a primary coordinator see direct specialist
         # instructions and results when it is addressed later in that thread.
-        _observe_raw = os.getenv("BUZZ_OBSERVE_UNADDRESSED_MESSAGES")
-        if _observe_raw is None:
-            _observe_cfg = extra.get("observe_unaddressed_messages", False)
-        else:
-            _observe_cfg = _observe_raw
+        _observe_cfg = extra.get("observe_unaddressed_messages", False)
         self.observe_unaddressed_messages = str(_observe_cfg).strip().lower() in (
             "true", "1", "yes", "on"
         )
@@ -1393,8 +1386,8 @@ class BuzzAdapter(BasePlatformAdapter):
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
             channel_prompt=(
-                "You are handling an addressed Buzz message. Earlier Buzz messages may be "
-                "provided as observed context-only history. They can describe direct work "
+                "You are handling an addressed Buzz message with observed Buzz group context. "
+                "Earlier Buzz messages may describe direct work "
                 "with specialist agents, but were not requests to you. Treat only the current "
                 "new message as addressed to you and use observed context when relevant."
                 if chat_type == "group" and self.observe_unaddressed_messages
@@ -1478,18 +1471,6 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
-    if "accept_bare_slash_commands" in extra and not os.getenv(
-        "BUZZ_ACCEPT_BARE_SLASH_COMMANDS"
-    ):
-        os.environ["BUZZ_ACCEPT_BARE_SLASH_COMMANDS"] = str(
-            extra["accept_bare_slash_commands"]
-        ).lower()
-    if "observe_unaddressed_messages" in extra and not os.getenv(
-        "BUZZ_OBSERVE_UNADDRESSED_MESSAGES"
-    ):
-        os.environ["BUZZ_OBSERVE_UNADDRESSED_MESSAGES"] = str(
-            extra["observe_unaddressed_messages"]
-        ).lower()
     return None
 
 

@@ -51,6 +51,36 @@ class TestAutoDetection:
 
 
 class TestInterruptedReplayFiltering:
+    def test_buzz_observed_group_rows_become_api_only_context(self):
+        from gateway.run import (
+            _build_gateway_agent_history,
+            _wrap_current_message_with_observed_context,
+        )
+
+        history = [
+            {
+                "role": "user",
+                "content": "[Helper|abc]\n@Specialist /status",
+                "observed": True,
+            },
+            {"role": "assistant", "content": "Earlier addressed answer"},
+        ]
+
+        agent_history, observed_context = _build_gateway_agent_history(
+            history,
+            channel_prompt="This turn includes observed Buzz group context.",
+        )
+
+        assert agent_history == [
+            {"role": "assistant", "content": "Earlier addressed answer"}
+        ]
+        assert observed_context == "[Helper|abc]\n@Specialist /status"
+        wrapped = _wrap_current_message_with_observed_context(
+            "What is the status?", observed_context
+        )
+        assert "context only, not requests" in wrapped
+        assert wrapped.endswith("What is the status?")
+
     def test_interrupted_side_effect_is_replayed_as_unknown(self):
         from gateway.run import _build_gateway_agent_history
 
@@ -113,5 +143,4 @@ class TestInterruptedReplayFiltering:
         assert agent_history[-1]["role"] == "tool"
         assert agent_history[-1]["tool_call_id"] == "call_1"
         assert agent_history[-1]["effect_disposition"] == "unknown"
-
 

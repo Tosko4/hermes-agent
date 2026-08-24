@@ -43,8 +43,6 @@ _ENV_VARS = (
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
     "BUZZ_REQUIRE_MENTION",
-    "BUZZ_ACCEPT_BARE_SLASH_COMMANDS",
-    "BUZZ_OBSERVE_UNADDRESSED_MESSAGES",
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
@@ -144,6 +142,24 @@ class TestBuzzAdapterInit:
         assert adapter.require_mention is True
         assert adapter.accept_bare_slash_commands is True
         assert adapter.observe_unaddressed_messages is True
+
+    def test_primary_agent_behavior_stays_profile_scoped(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_ACCEPT_BARE_SLASH_COMMANDS", "true")
+        monkeypatch.setenv("BUZZ_OBSERVE_UNADDRESSED_MESSAGES", "true")
+        from gateway.config import PlatformConfig
+
+        specialist = BuzzAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "accept_bare_slash_commands": False,
+                    "observe_unaddressed_messages": False,
+                },
+            )
+        )
+
+        assert specialist.accept_bare_slash_commands is False
+        assert specialist.observe_unaddressed_messages is False
 
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
