@@ -160,6 +160,15 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "discord", "long_running_notifications") is True
         assert resolve_display_setting({}, "discord", "busy_ack_detail") is True
 
+    def test_buzz_keeps_commentary_visible_and_tools_in_activity(self):
+        """Buzz shows model progress in chat without duplicating tool calls."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "buzz", "tool_progress") == "off"
+        assert resolve_display_setting({}, "buzz", "streaming") is False
+        assert resolve_display_setting({}, "buzz", "interim_assistant_messages") is True
+        assert resolve_display_setting({}, "buzz", "busy_ack_detail") is False
+
     def test_slack_workspace_chatter_defaults(self):
         """Slack should not leave permanent heartbeat/debug breadcrumbs in channels."""
         from gateway.display_config import resolve_display_setting
@@ -300,5 +309,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 
