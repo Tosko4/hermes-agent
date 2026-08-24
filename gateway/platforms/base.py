@@ -2916,6 +2916,11 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    # Whether the platform can surface structured, out-of-band tool activity.
+    # Unlike chat progress bubbles this is an owner-facing activity surface, so
+    # enabling it never adds messages to the conversation timeline.
+    supports_structured_tool_activity: bool = False
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 
@@ -4375,6 +4380,32 @@ class BasePlatformAdapter(ABC):
         Default is a no-op for platforms with one-shot typing indicators.
         """
         pass
+
+    async def publish_tool_started(
+        self,
+        chat_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        *,
+        session_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish one structured tool-start event outside the chat timeline."""
+
+    async def publish_tool_completed(
+        self,
+        chat_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        *,
+        is_error: bool = False,
+        session_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish one structured tool-completion event outside the chat timeline."""
 
     async def _stop_typing_with_metadata(self, chat_id: str, metadata=None) -> None:
         """Stop typing while preserving platform-specific routing metadata.

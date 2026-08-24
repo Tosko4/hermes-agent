@@ -28,6 +28,9 @@ Configuration in config.yaml::
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
             observe_unaddressed_messages: false  # context-only; never dispatches the agent
+            channel_skill_bindings:    # auto-load one or more skills per Buzz channel/forum
+              - id: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
+                skills: [research, summarize]
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -80,9 +83,11 @@ logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    SendResult,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
+    SendResult,
+    resolve_channel_skills,
 )
 from gateway.config import Platform
 
@@ -360,6 +365,8 @@ class BuzzAdapter(BasePlatformAdapter):
     Instantiated by the adapter_factory passed to register_platform().
     """
 
+    supports_structured_tool_activity = True
+
     def __init__(self, config, **kwargs):
         platform = Platform("buzz")
         super().__init__(config=config, platform=platform)
@@ -449,6 +456,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
+        self._typing_publish_tasks: Dict[str, asyncio.Task] = {}
+        self._activity_publish_tasks: set[asyncio.Task] = set()
         self._presence_announced = False
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
@@ -598,6 +607,24 @@ class BuzzAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        typing_publish_tasks = list(
+            getattr(self, "_typing_publish_tasks", {}).values()
+        )
+        for task in typing_publish_tasks:
+            if not task.done():
+                task.cancel()
+        if typing_publish_tasks:
+            await asyncio.gather(*typing_publish_tasks, return_exceptions=True)
+        self._typing_publish_tasks = {}
+        activity_publish_tasks = list(
+            getattr(self, "_activity_publish_tasks", set())
+        )
+        for task in activity_publish_tasks:
+            if not task.done():
+                task.cancel()
+        if activity_publish_tasks:
+            await asyncio.gather(*activity_publish_tasks, return_exceptions=True)
+        self._activity_publish_tasks = set()
         if self._presence_task and not self._presence_task.done():
             self._presence_task.cancel()
             try:
@@ -701,8 +728,196 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
+        """Queue a short-lived Buzz typing heartbeat without blocking cadence."""
+        if not self.cli_path:
+            return
+        thread_id = str((metadata or {}).get("thread_id") or "")
+        route_key = f"{chat_id}:{thread_id}"
+        tasks = getattr(self, "_typing_publish_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._typing_publish_tasks = tasks
+        existing = tasks.get(route_key)
+        if existing is not None and not existing.done():
+            return
+
+        async def _publish() -> None:
+            args = ["messages", "typing", "--channel", str(chat_id)]
+            if thread_id:
+                args += ["--thread", thread_id]
+            try:
+                code, _out, err = await self._run_cli(args)
+            except Exception as exc:
+                logger.debug("Buzz: typing heartbeat failed for %s — %s", chat_id, exc)
+                return
+            if code != 0:
+                logger.debug(
+                    "Buzz: typing heartbeat failed for %s — %s",
+                    chat_id,
+                    _cli_error_message(err, code),
+                )
+
+        task = asyncio.create_task(_publish())
+        tasks[route_key] = task
+        task.add_done_callback(
+            lambda finished, key=route_key: tasks.pop(key, None)
+            if tasks.get(key) is finished
+            else None
+        )
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Typing is a renewable Buzz lease; stopping stops its refresh."""
+
+    async def _publish_activity(
+        self,
+        *,
+        chat_id: str,
+        kind: str,
+        payload: dict,
+        session_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        args = [
+            "agents",
+            "activity",
+            "--channel",
+            str(chat_id),
+            "--kind",
+            kind,
+            "--payload",
+            "-",
+        ]
+        # Buzz thread roots are the client-visible session identity. Prefer that
+        # over Hermes' internal transcript id so thread activity can be filtered
+        # consistently on Desktop and Android.
+        resolved_session = str((metadata or {}).get("thread_id") or "") or session_id
+        if resolved_session:
+            args += ["--session", resolved_session]
+        if turn_id:
+            args += ["--turn", str(turn_id)]
+        try:
+            code, _out, err = await self._run_cli(
+                args,
+                input_text=json.dumps(payload, separators=(",", ":")),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Buzz: structured activity publish failed for %s — %s",
+                chat_id,
+                exc,
+            )
+            return
+        if code != 0:
+            logger.debug(
+                "Buzz: structured activity publish failed for %s — %s",
+                chat_id,
+                _cli_error_message(err, code),
+            )
+
+    def _queue_activity(self, **kwargs) -> None:
+        """Publish best-effort activity without delaying the chat response."""
+        task = asyncio.create_task(self._publish_activity(**kwargs))
+        tasks = getattr(self, "_activity_publish_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._activity_publish_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def publish_tool_started(
+        self,
+        chat_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        *,
+        session_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        await self._publish_activity(
+            chat_id=chat_id,
+            kind="acp_read",
+            session_id=session_id,
+            turn_id=turn_id,
+            metadata=metadata,
+            payload={
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": tool_call_id,
+                        "title": tool_name,
+                        "toolName": tool_name,
+                        "status": "executing",
+                        "args": args or {},
+                    }
+                },
+            },
+        )
+
+    async def publish_tool_completed(
+        self,
+        chat_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        *,
+        is_error: bool = False,
+        session_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        await self._publish_activity(
+            chat_id=chat_id,
+            kind="acp_read",
+            session_id=session_id,
+            turn_id=turn_id,
+            metadata=metadata,
+            payload={
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "status": "failed" if is_error else "completed",
+                    }
+                },
+            },
+        )
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        source = event.source
+        turn_id = str(event.message_id or source.message_id or "")
+        self._queue_activity(
+            chat_id=source.chat_id,
+            kind="turn_started",
+            session_id=source.thread_id or turn_id,
+            turn_id=turn_id or None,
+            payload={"type": "turn_started"},
+        )
+
+    async def on_processing_complete(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        await super().on_processing_complete(event, outcome)
+        source = event.source
+        turn_id = str(event.message_id or source.message_id or "")
+        kind = (
+            "turn_completed"
+            if outcome is ProcessingOutcome.SUCCESS
+            else "turn_error"
+        )
+        self._queue_activity(
+            chat_id=source.chat_id,
+            kind=kind,
+            session_id=source.thread_id or turn_id,
+            turn_id=turn_id or None,
+            payload={"type": kind},
+        )
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
@@ -1472,6 +1687,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 if chat_type == "group" and self.observe_unaddressed_messages
                 else None
             ),
+            auto_skill=resolve_channel_skills(self._extra, chat_id),
         )
 
         await self.handle_message(event)

@@ -5218,6 +5218,57 @@ class TurnRunner:
             }
         )
 
+    def structured_tool_start_callback(self, call_id, tool_name, args):
+        """Project an ID-correlated tool start onto an out-of-band surface."""
+        ctx = self._ctx
+        adapter = ctx._structured_tool_activity_adapter
+        if adapter is None or not ctx._run_still_current():
+            return
+        try:
+            safe_schedule_threadsafe(
+                adapter.publish_tool_started(
+                    chat_id=ctx.source.chat_id,
+                    tool_call_id=str(call_id or ""),
+                    tool_name=str(tool_name or "tool"),
+                    args=args or {},
+                    session_id=ctx.session_id,
+                    turn_id=ctx.event_message_id,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                ctx._voice_ack_loop,
+                logger=logger,
+                log_message="structured tool-start scheduling error",
+            )
+        except Exception as exc:
+            logger.debug("structured tool-start projection failed: %s", exc)
+
+    def structured_tool_complete_callback(self, call_id, tool_name, args, result):
+        """Project an ID-correlated tool completion onto an out-of-band surface."""
+        ctx = self._ctx
+        adapter = ctx._structured_tool_activity_adapter
+        if adapter is None or not ctx._run_still_current():
+            return
+        try:
+            from agent.display import _detect_tool_failure
+
+            is_error, _ = _detect_tool_failure(str(tool_name or "tool"), result)
+            safe_schedule_threadsafe(
+                adapter.publish_tool_completed(
+                    chat_id=ctx.source.chat_id,
+                    tool_call_id=str(call_id or ""),
+                    tool_name=str(tool_name or "tool"),
+                    is_error=bool(is_error),
+                    session_id=ctx.session_id,
+                    turn_id=ctx.event_message_id,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                ctx._voice_ack_loop,
+                logger=logger,
+                log_message="structured tool-completion scheduling error",
+            )
+        except Exception as exc:
+            logger.debug("structured tool-completion projection failed: %s", exc)
+
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
         ctx = self._ctx
@@ -5225,6 +5276,16 @@ class TurnRunner:
             self.voice_ack_callback(call_id, tool_name, args)
         if ctx._native_slack_task_cards:
             self.native_tool_start_callback(call_id, tool_name, args)
+        if ctx._structured_tool_activity_adapter is not None:
+            self.structured_tool_start_callback(call_id, tool_name, args)
+
+    def combined_tool_complete_callback(self, call_id, tool_name, args, result):
+        """Compose native task-card and structured activity consumers."""
+        ctx = self._ctx
+        if ctx._native_slack_task_cards:
+            self.native_tool_complete_callback(call_id, tool_name, args, result)
+        if ctx._structured_tool_activity_adapter is not None:
+            self.structured_tool_complete_callback(call_id, tool_name, args, result)
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
@@ -5839,12 +5900,16 @@ class TurnRunner:
             if (
                 ctx._voice_ack_guild[0] is not None
                 or ctx._native_slack_task_cards
+                or ctx._structured_tool_activity_adapter is not None
             )
             else None
         )
         agent.tool_complete_callback = (
             ctx.native_tool_complete_callback
-            if ctx._native_slack_task_cards
+            if (
+                ctx._native_slack_task_cards
+                or ctx._structured_tool_activity_adapter is not None
+            )
             and ctx.native_tool_complete_callback is not None
             else None
         )
@@ -28477,6 +28542,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
+        _structured_tool_activity_adapter = None
+        if (
+            _progress_adapter_for_native is not None
+            and getattr(
+                _progress_adapter_for_native,
+                "supports_structured_tool_activity",
+                False,
+            )
+        ):
+            _structured_tool_activity_adapter = _progress_adapter_for_native
         needs_progress_queue = (
             tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
         )
@@ -28547,6 +28622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
+            _structured_tool_activity_adapter=_structured_tool_activity_adapter,
             _live_status_mode=_live_status_mode,
             _thinking_enabled=_thinking_enabled,
             progress_mode=progress_mode,
@@ -28594,9 +28670,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
         turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
-        turn_ctx.native_tool_complete_callback = (
-            turn_runner.native_tool_complete_callback
-        )
+        turn_ctx.native_tool_complete_callback = turn_runner.combined_tool_complete_callback
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.

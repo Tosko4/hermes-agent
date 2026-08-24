@@ -37,6 +37,7 @@ class TurnContext:
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
+    _structured_tool_activity_adapter: Any = None
     _live_status_mode: str = "off"
     _thinking_enabled: bool = False
     progress_mode: str = "off"
