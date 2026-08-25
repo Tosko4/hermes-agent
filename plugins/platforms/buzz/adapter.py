@@ -1429,6 +1429,13 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        quoted_context = await self._load_quoted_context(channel_id, event)
+        if quoted_context:
+            dispatch_text = (
+                "The user explicitly selected these earlier Buzz messages as context "
+                "for this thread:\n\n"
+                f"{quoted_context}\n\nCurrent message:\n{dispatch_text}"
+            )
         thread_id = None if is_dm else self._thread_root_id(event)
 
         await self._dispatch_message(
@@ -1472,6 +1479,74 @@ class BuzzAdapter(BasePlatformAdapter):
                 ):
                     return str(tag[1])
         return None
+
+    @staticmethod
+    def _quoted_event_ids(event: dict) -> list[str]:
+        """Return de-duplicated NIP-18 quote ids in selection order."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "q":
+                continue
+            event_id = str(tag[1]).lower()
+            if len(event_id) != 64 or any(char not in "0123456789abcdef" for char in event_id):
+                continue
+            if event_id not in seen:
+                seen.add(event_id)
+                result.append(event_id)
+        return result
+
+    async def _load_quoted_context(self, channel_id: str, event: dict) -> str:
+        """Hydrate all explicitly selected thread context without truncation.
+
+        Android adds standard NIP-18 ``q`` tags to the first and subsequent
+        messages in a user-created thread. Each selected item is a top-level
+        channel message, so ``messages thread`` can fetch it exactly. Fetches
+        run in small batches to preserve an unbounded UX without spawning an
+        unbounded number of CLI processes.
+        """
+        event_ids = self._quoted_event_ids(event)
+        if not event_ids:
+            return ""
+
+        async def fetch(event_id: str) -> Optional[dict]:
+            code, out, _err = await self._run_cli(
+                [
+                    "messages",
+                    "thread",
+                    "--channel",
+                    str(channel_id),
+                    "--event",
+                    event_id,
+                    "--limit",
+                    "1",
+                    "--depth-limit",
+                    "0",
+                ]
+            )
+            if code != 0:
+                return None
+            for candidate in _parse_json_list(out):
+                if str(candidate.get("id") or "").lower() == event_id:
+                    return candidate
+            return None
+
+        selected: list[dict] = []
+        for offset in range(0, len(event_ids), 8):
+            batch = await asyncio.gather(
+                *(fetch(event_id) for event_id in event_ids[offset : offset + 8])
+            )
+            selected.extend(candidate for candidate in batch if candidate is not None)
+
+        rows = []
+        for candidate in selected:
+            author = str(candidate.get("pubkey") or "unknown")[:12]
+            body = str(candidate.get("content") or "")
+            rows.append(f"[{author}]\n{body}")
+        return "\n\n".join(rows)
 
     async def _observe_unaddressed_message(
         self,

@@ -523,6 +523,42 @@ class TestThreadRouting:
         )
         assert BuzzAdapter._thread_root_id(event) == "root"
 
+    def test_quote_ids_are_ordered_deduplicated_and_validated(self):
+        first = "1" * 64
+        second = "2" * 64
+        event = _event("reply")
+        event["tags"].extend(
+            [["q", first], ["q", "not-an-event"], ["q", second], ["q", first]]
+        )
+        assert BuzzAdapter._quoted_event_ids(event) == [first, second]
+
+    @pytest.mark.asyncio
+    async def test_selected_message_context_is_hydrated_without_changing_content(self):
+        adapter = _make_adapter()
+        first = "1" * 64
+        second = "2" * 64
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "thread",
+            [{"id": first, "pubkey": "a" * 64, "content": "first full message"}],
+        )
+        cli.script(
+            "messages",
+            "thread",
+            [{"id": second, "pubkey": "b" * 64, "content": "second full message"}],
+        )
+        adapter._run_cli = cli
+        event = _event("reply")
+        event["tags"].extend([["q", first], ["q", second]])
+
+        context = await adapter._load_quoted_context(CHANNEL, event)
+
+        assert "first full message" in context
+        assert "second full message" in context
+        assert len(cli.calls) == 2
+        assert all("--depth-limit" in args for args, _stdin in cli.calls)
+
     @pytest.mark.asyncio
     async def test_dispatch_carries_stable_thread_and_message_anchor(self):
         adapter = _make_adapter({"home_channel": CHANNEL})
