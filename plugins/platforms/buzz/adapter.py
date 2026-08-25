@@ -43,6 +43,7 @@ environment and is never logged.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -80,6 +81,10 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+
+_LONG_MESSAGE_FILENAME = "buzz-message.md"
+_LONG_MESSAGE_MARKER = "The complete lossless message is attached as buzz-message.md."
+_LONG_MESSAGE_MAX_BYTES = 100 * 1024 * 1024
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -138,7 +143,9 @@ def _load_nostr_auth():
         import importlib.util
 
         path = Path(__file__).with_name("nostr_auth.py")
-        spec = importlib.util.spec_from_file_location("plugin_adapter_buzz_nostr_auth", path)
+        spec = importlib.util.spec_from_file_location(
+            "plugin_adapter_buzz_nostr_auth", path
+        )
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -168,7 +175,9 @@ def _bech32_hrp_expand(hrp: str) -> List[int]:
     return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
 
 
-def _convertbits(data, frombits: int, tobits: int, pad: bool = True) -> Optional[List[int]]:
+def _convertbits(
+    data, frombits: int, tobits: int, pad: bool = True
+) -> Optional[List[int]]:
     acc = 0
     bits = 0
     ret = []
@@ -211,7 +220,7 @@ def npub_to_hex(npub: str) -> Optional[str]:
     npub = npub.strip().lower()
     if not npub.startswith("npub1"):
         return None
-    data_part = npub[len("npub1"):]
+    data_part = npub[len("npub1") :]
     try:
         data = [_BECH32_CHARSET.index(c) for c in data_part]
     except ValueError:
@@ -240,6 +249,7 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
 # buzz-cli invocation helpers
 # ---------------------------------------------------------------------------
 
+
 def _resolve_cli_path(configured: str = "") -> str:
     """Resolve the buzz CLI binary path portably.
 
@@ -264,7 +274,9 @@ def _resolve_private_key(extra: Optional[dict] = None) -> str:
     key = _get_scoped_secret("BUZZ_PRIVATE_KEY", "").strip()
     if key:
         return key
-    configured = os.getenv("BUZZ_CREDENTIALS_FILE", "").strip() or (extra or {}).get("credentials_file", "")
+    configured = os.getenv("BUZZ_CREDENTIALS_FILE", "").strip() or (extra or {}).get(
+        "credentials_file", ""
+    )
     if configured:
         candidates = [Path(configured).expanduser()]
     else:
@@ -307,23 +319,67 @@ async def _exec_buzz(
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
-        stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE
+        if input_text is not None
+        else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input_text.encode("utf-8") if input_text is not None else None),
+            proc.communicate(
+                input_text.encode("utf-8") if input_text is not None else None
+            ),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, "", json.dumps({"error": "timeout", "message": f"buzz {args[0] if args else ''} timed out after {timeout}s"})
+        return (
+            124,
+            "",
+            json.dumps({
+                "error": "timeout",
+                "message": f"buzz {args[0] if args else ''} timed out after {timeout}s",
+            }),
+        )
     return (
         proc.returncode if proc.returncode is not None else 4,
         stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
+
+async def _exec_buzz_bytes(
+    cli_path: str,
+    args: List[str],
+    *,
+    relay_url: str,
+    private_key: str,
+    timeout: float = _CLI_TIMEOUT,
+) -> Tuple[int, bytes, str]:
+    """Run one Buzz CLI read that deliberately returns raw bytes on stdout."""
+    env = os.environ.copy()
+    env["BUZZ_RELAY_URL"] = relay_url
+    env["BUZZ_PRIVATE_KEY"] = private_key
+    proc = await asyncio.create_subprocess_exec(
+        cli_path,
+        *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, b"", f"buzz media get timed out after {timeout}s"
+    return (
+        proc.returncode if proc.returncode is not None else 4,
+        stdout,
         stderr.decode("utf-8", errors="replace"),
     )
 
@@ -338,7 +394,9 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     try:
         data = json.loads(text)
         if isinstance(data, dict) and data.get("message"):
-            return f"{data.get('error', 'error')}: {data['message']} (exit {returncode})"
+            return (
+                f"{data.get('error', 'error')}: {data['message']} (exit {returncode})"
+            )
     except ValueError:
         pass
     return text or f"buzz CLI failed with exit code {returncode}"
@@ -359,6 +417,7 @@ def _parse_json_list(stdout: str) -> List[dict]:
 # Buzz Adapter
 # ---------------------------------------------------------------------------
 
+
 class BuzzAdapter(BasePlatformAdapter):
     """Poll-based Buzz adapter implementing the BasePlatformAdapter interface.
 
@@ -375,21 +434,31 @@ class BuzzAdapter(BasePlatformAdapter):
         self._extra = extra
 
         # Connection settings (env vars override config.yaml)
-        self.relay_url = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
+        self.relay_url = (
+            os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")
+        ).strip()
         self.cli_path = _resolve_cli_path(
-            os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+            os.getenv("BUZZ_CLI_PATH", "").strip()
+            or str(extra.get("cli_path", "") or "")
         )
 
         # Channels to watch: env csv > extra list/csv; empty = all joined channels
         raw_channels = os.getenv("BUZZ_CHANNELS") or extra.get("channels", [])
         if isinstance(raw_channels, str):
             raw_channels = raw_channels.split(",")
-        self.channels: List[str] = [c.strip() for c in raw_channels if isinstance(c, str) and c.strip()]
+        self.channels: List[str] = [
+            c.strip() for c in raw_channels if isinstance(c, str) and c.strip()
+        ]
 
-        self.home_channel = (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+        self.home_channel = (
+            os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")
+        ).strip()
 
         try:
-            interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
+            interval = float(
+                os.getenv("BUZZ_POLL_INTERVAL")
+                or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL)
+            )
         except (TypeError, ValueError):
             interval = _DEFAULT_POLL_INTERVAL
         self.poll_interval = max(_MIN_POLL_INTERVAL, interval)
@@ -403,7 +472,12 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = extra.get("require_mention", True)
         else:
             _rm_cfg = _rm_raw
-        self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+        self.require_mention = str(_rm_cfg).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
 
         # A bare `/command` can be reserved for one primary agent (Nabu) while
         # specialist agents still require explicit `@name /command`
@@ -411,7 +485,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # not all consume the same unaddressed command.
         _bare_slash_cfg = extra.get("accept_bare_slash_commands", False)
         self.accept_bare_slash_commands = str(_bare_slash_cfg).strip().lower() in (
-            "true", "1", "yes", "on"
+            "true",
+            "1",
+            "yes",
+            "on",
         )
 
         # Preserve unaddressed channel/forum traffic as context in the
@@ -420,7 +497,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # instructions and results when it is addressed later in that thread.
         _observe_cfg = extra.get("observe_unaddressed_messages", False)
         self.observe_unaddressed_messages = str(_observe_cfg).strip().lower() in (
-            "true", "1", "yes", "on"
+            "true",
+            "1",
+            "yes",
+            "on",
         )
 
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
@@ -428,9 +508,16 @@ class BuzzAdapter(BasePlatformAdapter):
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
         # config.yaml.
         _transport = (
-            os.getenv("BUZZ_TRANSPORT") or str(extra.get("transport", "auto") or "auto")
-        ).strip().lower()
-        self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
+            (
+                os.getenv("BUZZ_TRANSPORT")
+                or str(extra.get("transport", "auto") or "auto")
+            )
+            .strip()
+            .lower()
+        )
+        self.transport = (
+            _transport if _transport in ("auto", "websocket", "poll") else "auto"
+        )
 
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
         raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
@@ -478,7 +565,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
-    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+    async def _run_cli(
+        self, args: List[str], *, input_text: Optional[str] = None
+    ) -> Tuple[int, str, str]:
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
         return await _exec_buzz(
@@ -489,22 +578,42 @@ class BuzzAdapter(BasePlatformAdapter):
             input_text=input_text,
         )
 
+    async def _run_cli_bytes(self, args: List[str]) -> Tuple[int, bytes, str]:
+        if not self._private_key:
+            self._private_key = _resolve_private_key(self._extra)
+        return await _exec_buzz_bytes(
+            self.cli_path,
+            args,
+            relay_url=self.relay_url,
+            private_key=self._private_key,
+        )
+
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Verify relay credentials, seed high-water marks, start polling."""
         if not self.relay_url:
             logger.error("Buzz: relay URL must be configured")
-            self._set_fatal_error("config_missing", "BUZZ_RELAY_URL must be set", retryable=False)
+            self._set_fatal_error(
+                "config_missing", "BUZZ_RELAY_URL must be set", retryable=False
+            )
             return False
         if not self.cli_path:
-            logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
-            self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
+            logger.error(
+                "Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)"
+            )
+            self._set_fatal_error(
+                "cli_missing", "buzz CLI binary not found", retryable=False
+            )
             return False
         self._private_key = _resolve_private_key(self._extra)
         if not self._private_key:
-            logger.error("Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)")
-            self._set_fatal_error("config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False)
+            logger.error(
+                "Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)"
+            )
+            self._set_fatal_error(
+                "config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False
+            )
             return False
 
         # Learn our own identity: pubkey drives self-echo suppression and
@@ -512,13 +621,21 @@ class BuzzAdapter(BasePlatformAdapter):
         code, out, err = await self._run_cli(["users", "get"])
         if code != 0:
             message = _cli_error_message(err, code)
-            logger.error("Buzz: failed to fetch own profile from %s — %s", self.relay_url, message)
+            logger.error(
+                "Buzz: failed to fetch own profile from %s — %s",
+                self.relay_url,
+                message,
+            )
             self._set_fatal_error("connect_failed", message, retryable=code == 2)
             return False
         profiles = _parse_json_list(out)
         if not profiles or not profiles[0].get("pubkey"):
-            logger.error("Buzz: 'users get' returned no profile — is the key a member of this community?")
-            self._set_fatal_error("connect_failed", "buzz users get returned no profile", retryable=True)
+            logger.error(
+                "Buzz: 'users get' returned no profile — is the key a member of this community?"
+            )
+            self._set_fatal_error(
+                "connect_failed", "buzz users get returned no profile", retryable=True
+            )
             return False
         self._self_pubkey = str(profiles[0]["pubkey"]).lower()
         self._display_name = str(profiles[0].get("display_name") or "").strip()
@@ -538,7 +655,9 @@ class BuzzAdapter(BasePlatformAdapter):
                     self.relay_url,
                 )
                 self._set_fatal_error(
-                    "lock_conflict", "Buzz identity in use by another profile", retryable=False
+                    "lock_conflict",
+                    "Buzz identity in use by another profile",
+                    retryable=False,
                 )
                 return False
             self._lock_key = lock_key
@@ -563,8 +682,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._channel_meta[str(ch["channel_id"])] = ch
         watch = self.channels or list(self._channel_names)
         if not watch:
-            logger.error("Buzz: no channels to watch (configure BUZZ_CHANNELS or join a channel)")
-            self._set_fatal_error("config_missing", "no Buzz channels to watch", retryable=False)
+            logger.error(
+                "Buzz: no channels to watch (configure BUZZ_CHANNELS or join a channel)"
+            )
+            self._set_fatal_error(
+                "config_missing", "no Buzz channels to watch", retryable=False
+            )
             return False
 
         # Seed high-water marks from the newest events so a (re)start never
@@ -600,25 +723,23 @@ class BuzzAdapter(BasePlatformAdapter):
             self._display_name or self._self_npub[:16],
             len(self._channel_state),
             transport_used,
-            "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
+            ""
+            if transport_used == "websocket"
+            else f", poll interval {self.poll_interval:.1f}s",
         )
         return True
 
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
-        typing_publish_tasks = list(
-            getattr(self, "_typing_publish_tasks", {}).values()
-        )
+        typing_publish_tasks = list(getattr(self, "_typing_publish_tasks", {}).values())
         for task in typing_publish_tasks:
             if not task.done():
                 task.cancel()
         if typing_publish_tasks:
             await asyncio.gather(*typing_publish_tasks, return_exceptions=True)
         self._typing_publish_tasks = {}
-        activity_publish_tasks = list(
-            getattr(self, "_activity_publish_tasks", set())
-        )
+        activity_publish_tasks = list(getattr(self, "_activity_publish_tasks", set()))
         for task in activity_publish_tasks:
             if not task.done():
                 task.cancel()
@@ -663,9 +784,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _publish_presence(self, status: str) -> bool:
         """Publish one authenticated ephemeral presence update."""
-        code, _out, err = await self._run_cli(
-            ["users", "set-presence", "--status", status]
-        )
+        code, _out, err = await self._run_cli([
+            "users",
+            "set-presence",
+            "--status",
+            status,
+        ])
         if code != 0:
             logger.warning(
                 "Buzz: failed to publish %s presence — %s",
@@ -804,9 +928,9 @@ class BuzzAdapter(BasePlatformAdapter):
         task = asyncio.create_task(_publish())
         tasks[route_key] = task
         task.add_done_callback(
-            lambda finished, key=route_key: tasks.pop(key, None)
-            if tasks.get(key) is finished
-            else None
+            lambda finished, key=route_key: (
+                tasks.pop(key, None) if tasks.get(key) is finished else None
+            )
         )
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
@@ -956,9 +1080,7 @@ class BuzzAdapter(BasePlatformAdapter):
         source = event.source
         turn_id = str(event.message_id or source.message_id or "")
         kind = (
-            "turn_completed"
-            if outcome is ProcessingOutcome.SUCCESS
-            else "turn_error"
+            "turn_completed" if outcome is ProcessingOutcome.SUCCESS else "turn_error"
         )
         self._queue_activity(
             chat_id=source.chat_id,
@@ -982,15 +1104,20 @@ class BuzzAdapter(BasePlatformAdapter):
         # The event id IS the message_id we recorded on dispatch; channel is
         # not a parameter to this subcommand.
         args = [
-            "reactions", "add",
-            "--event", str(message_id),
-            "--emoji", emoji,
+            "reactions",
+            "add",
+            "--event",
+            str(message_id),
+            "--emoji",
+            emoji,
         ]
         code, _out, err = await self._run_cli(args)
         if code != 0:
             logger.debug(
                 "Buzz: reaction add failed for message %s in %s — %s",
-                message_id[:12], chat_id, _cli_error_message(err, code),
+                message_id[:12],
+                chat_id,
+                _cli_error_message(err, code),
             )
             return False
         return True
@@ -1004,19 +1131,31 @@ class BuzzAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image: local files upload via --file, URLs go as a link."""
-        local = Path(image_url).expanduser() if not image_url.startswith(("http://", "https://")) else None
+        local = (
+            Path(image_url).expanduser()
+            if not image_url.startswith(("http://", "https://"))
+            else None
+        )
         if local is not None and local.is_file():
             args = [
-                "messages", "send",
-                "--channel", str(chat_id),
-                "--file", str(local),
-                "--content", "-",
+                "messages",
+                "send",
+                "--channel",
+                str(chat_id),
+                "--file",
+                str(local),
+                "--content",
+                "-",
             ]
             if reply_to:
                 args += ["--reply-to", str(reply_to)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
-                return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
+                return SendResult(
+                    success=False,
+                    error=_cli_error_message(err, code),
+                    retryable=code == 2,
+                )
             try:
                 data = json.loads(out or "{}")
             except ValueError:
@@ -1039,7 +1178,12 @@ class BuzzAdapter(BasePlatformAdapter):
         chat_type = state["chat_type"] if state else "group"
         name = self._channel_names.get(chat_id)
         if name is None and self.cli_path:
-            code, out, _err = await self._run_cli(["channels", "get", "--channel", chat_id])
+            code, out, _err = await self._run_cli([
+                "channels",
+                "get",
+                "--channel",
+                chat_id,
+            ])
             if code == 0:
                 try:
                     data = json.loads(out or "{}")
@@ -1071,7 +1215,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
             self._websocket_url()
         except Exception as e:
-            logger.info("Buzz: WebSocket transport unavailable (%s); falling back to polling", e)
+            logger.info(
+                "Buzz: WebSocket transport unavailable (%s); falling back to polling", e
+            )
             return False
         self._ws_ready = asyncio.Event()
         self._membership_since = int(time.time())
@@ -1113,7 +1259,11 @@ class BuzzAdapter(BasePlatformAdapter):
             response = json.loads(raw)
             if not isinstance(response, list) or not response:
                 continue
-            if response[0] == "OK" and len(response) >= 4 and response[1] == event["id"]:
+            if (
+                response[0] == "OK"
+                and len(response) >= 4
+                and response[1] == event["id"]
+            ):
                 if response[2] is True:
                     return
                 raise ConnectionError(f"Buzz WebSocket AUTH rejected: {response[3]}")
@@ -1121,7 +1271,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 detail = response[-1] if len(response) > 1 else "authentication failed"
                 raise ConnectionError(f"Buzz WebSocket AUTH failed: {detail}")
 
-    async def _send_channel_subscription(self, websocket, subscription_id: str, channel_id: str) -> None:
+    async def _send_channel_subscription(
+        self, websocket, subscription_id: str, channel_id: str
+    ) -> None:
         state = self._channel_state.get(channel_id) or {}
         since = max(int(state.get("last_ts") or time.time()) - 1, 0)
         request = [
@@ -1138,7 +1290,9 @@ class BuzzAdapter(BasePlatformAdapter):
         for index, channel_id in enumerate(list(self._channel_state)):
             subscription_id = f"hermes-buzz-{index}"
             subscriptions[subscription_id] = channel_id
-            await self._send_channel_subscription(websocket, subscription_id, channel_id)
+            await self._send_channel_subscription(
+                websocket, subscription_id, channel_id
+            )
         if self._self_pubkey:
             request = [
                 "REQ",
@@ -1153,10 +1307,14 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
         return subscriptions
 
-    async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
+    async def _handle_membership_event(
+        self, websocket, subscriptions: Dict[str, Optional[str]], event: dict
+    ) -> None:
         """A membership event p-tagged to us: rediscover conversations and
         subscribe to any new ones (fresh DMs dispatch from their beginning)."""
-        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
+        self._membership_since = max(
+            self._membership_since, int(event.get("created_at") or 0)
+        )
         before = set(self._channel_state)
         await self._discover_dms(seed=False)
         for channel_id in self._channel_state:
@@ -1164,7 +1322,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
-            await self._send_channel_subscription(websocket, subscription_id, channel_id)
+            await self._send_channel_subscription(
+                websocket, subscription_id, channel_id
+            )
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
 
     async def _websocket_loop(self) -> None:
@@ -1197,7 +1357,9 @@ class BuzzAdapter(BasePlatformAdapter):
                             try:
                                 message = json.loads(raw)
                             except (ValueError, TypeError):
-                                logger.warning("Buzz: ignoring malformed WebSocket frame")
+                                logger.warning(
+                                    "Buzz: ignoring malformed WebSocket frame"
+                                )
                                 continue
                             if not isinstance(message, list) or not message:
                                 continue
@@ -1207,7 +1369,9 @@ class BuzzAdapter(BasePlatformAdapter):
                                 if not isinstance(event, dict):
                                     continue
                                 if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    await self._handle_membership_event(websocket, subscriptions, event)
+                                    await self._handle_membership_event(
+                                        websocket, subscriptions, event
+                                    )
                                     continue
                                 channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
@@ -1215,8 +1379,14 @@ class BuzzAdapter(BasePlatformAdapter):
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
                             elif message[0] == "CLOSED":
-                                subscription_id = str(message[1]) if len(message) > 1 else ""
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
+                                subscription_id = (
+                                    str(message[1]) if len(message) > 1 else ""
+                                )
+                                detail = (
+                                    message[-1]
+                                    if len(message) > 2
+                                    else "subscription closed"
+                                )
                                 channel_id = subscriptions.pop(subscription_id, None)
                                 if channel_id:
                                     # One stale or revoked channel must not tear
@@ -1233,7 +1403,10 @@ class BuzzAdapter(BasePlatformAdapter):
                                     )
                                     continue
                                 if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    logger.warning("Buzz: membership subscription closed: %s", detail)
+                                    logger.warning(
+                                        "Buzz: membership subscription closed: %s",
+                                        detail,
+                                    )
                                     continue
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
@@ -1242,7 +1415,11 @@ class BuzzAdapter(BasePlatformAdapter):
                     raise
                 except Exception as e:
                     self._ws_active = False
-                    logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
+                    logger.warning(
+                        "Buzz: WebSocket disconnected; retrying in %.1fs: %s",
+                        backoff,
+                        e,
+                    )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
@@ -1272,12 +1449,19 @@ class BuzzAdapter(BasePlatformAdapter):
         """Initialize a channel's high-water mark from its newest events."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
         self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
+        code, out, err = await self._run_cli([
+            "messages",
+            "get",
+            "--channel",
+            channel_id,
+            "--limit",
+            str(_FETCH_LIMIT),
+        ])
         if code != 0:
             logger.warning(
-                "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
+                "Buzz: could not seed channel %s — %s",
+                channel_id,
+                _cli_error_message(err, code),
             )
             # Fall back to "now" so a transiently unreadable channel does not
             # replay its whole history once it becomes readable.
@@ -1317,7 +1501,11 @@ class BuzzAdapter(BasePlatformAdapter):
                 if seed:
                     await self._seed_channel(dm_id, chat_type="dm")
                 else:
-                    self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
+                    self._channel_state[dm_id] = {
+                        "chat_type": "dm",
+                        "last_ts": 0,
+                        "seen": OrderedDict(),
+                    }
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
@@ -1334,13 +1522,24 @@ class BuzzAdapter(BasePlatformAdapter):
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = {
+                    "chat_type": "group",
+                    "last_ts": 0,
+                    "seen": OrderedDict(),
+                }
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
         if state is None:
             return
-        args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        args = [
+            "messages",
+            "get",
+            "--channel",
+            channel_id,
+            "--limit",
+            str(_FETCH_LIMIT),
+        ]
         if state["last_ts"]:
             # Nostr `since` is inclusive: same-second events are re-fetched
             # and de-duped by id below.
@@ -1348,7 +1547,9 @@ class BuzzAdapter(BasePlatformAdapter):
         code, out, err = await self._run_cli(args)
         if code != 0:
             logger.debug(
-                "Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code)
+                "Buzz: poll of channel %s failed — %s",
+                channel_id,
+                _cli_error_message(err, code),
             )
             return
         for event in _parse_json_list(out):
@@ -1371,6 +1572,8 @@ class BuzzAdapter(BasePlatformAdapter):
         if not pubkey or not isinstance(content, str) or not content.strip():
             return
 
+        content = await self._hydrate_long_message_attachment(event, content)
+
         # Suppress self-echo: never dispatch our own messages back to the agent.
         if pubkey == self._self_pubkey:
             return
@@ -1384,16 +1587,21 @@ class BuzzAdapter(BasePlatformAdapter):
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
         if not is_dm:
-            is_home_channel = bool(self.home_channel) and channel_id == self.home_channel
+            is_home_channel = (
+                bool(self.home_channel) and channel_id == self.home_channel
+            )
             is_bare_slash = content.lstrip().startswith("/")
             explicitly_targeted_elsewhere = (
                 is_home_channel and self._has_foreign_only_p_targets(event)
             )
             implicitly_addressed = (
-                (is_home_channel and not explicitly_targeted_elsewhere)
-                or (self.accept_bare_slash_commands and is_bare_slash)
-            )
-            if self.require_mention and not implicitly_addressed and not self._is_mentioned(content):
+                is_home_channel and not explicitly_targeted_elsewhere
+            ) or (self.accept_bare_slash_commands and is_bare_slash)
+            if (
+                self.require_mention
+                and not implicitly_addressed
+                and not self._is_mentioned(content)
+            ):
                 if self.observe_unaddressed_messages:
                     await self._observe_unaddressed_message(
                         channel_id=channel_id,
@@ -1421,7 +1629,9 @@ class BuzzAdapter(BasePlatformAdapter):
                     event=event,
                     created_at=created_at,
                 )
-            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
+            logger.debug(
+                "Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8]
+            )
             return
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
@@ -1449,6 +1659,92 @@ class BuzzAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             raw_event=event,
         )
+
+    async def _hydrate_long_message_attachment(self, event: dict, content: str) -> str:
+        """Replace Buzz's frame-safe marker with its verified Markdown source.
+
+        Android moves drafts above the relay's inline websocket budget to a
+        content-addressed same-origin attachment. Only that exact marker and
+        filename opt into hydration. The URL must remain on this relay's media
+        origin, the declared size is bounded by the relay's generic-file cap,
+        and both size and SHA-256 are verified before any text reaches Hermes.
+        """
+        if not content.startswith(_LONG_MESSAGE_MARKER):
+            return content
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return content
+        attachment = None
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "imeta":
+                continue
+            fields = {}
+            for raw in tag[1:]:
+                if not isinstance(raw, str) or " " not in raw:
+                    continue
+                name, value = raw.split(" ", 1)
+                fields[name] = value
+            if fields.get("filename") == _LONG_MESSAGE_FILENAME:
+                attachment = fields
+                break
+        if attachment is None:
+            return content
+
+        url = attachment.get("url", "")
+        digest = attachment.get("x", "").lower()
+        try:
+            declared_size = int(attachment.get("size", "0"))
+        except (TypeError, ValueError):
+            return content
+        relay = urlsplit(self.relay_url)
+        target = urlsplit(url)
+        if (
+            target.scheme not in ("http", "https")
+            or target.hostname != relay.hostname
+            or target.port != relay.port
+            or not target.path.startswith("/media/")
+            or target.query
+            or target.fragment
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or declared_size <= 0
+            or declared_size > _LONG_MESSAGE_MAX_BYTES
+        ):
+            return content
+
+        code, payload, _stderr = await self._run_cli_bytes([
+            "media",
+            "get",
+            url,
+            "--output",
+            "-",
+        ])
+        if code != 0 or len(payload) > _LONG_MESSAGE_MAX_BYTES:
+            logger.warning(
+                "Buzz: authenticated long-message download failed for %s",
+                event.get("id"),
+            )
+            return content
+
+        def verify() -> Optional[str]:
+            if (
+                len(payload) != declared_size
+                or hashlib.sha256(payload).hexdigest() != digest
+            ):
+                return None
+            try:
+                hydrated = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            return hydrated if hydrated.strip() else None
+
+        hydrated = await asyncio.to_thread(verify)
+        if hydrated is None:
+            logger.warning(
+                "Buzz: could not verify long-message attachment for %s", event.get("id")
+            )
+            return content
+        return hydrated
 
     @staticmethod
     def _thread_root_id(event: dict) -> Optional[str]:
@@ -1492,7 +1788,9 @@ class BuzzAdapter(BasePlatformAdapter):
             if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "q":
                 continue
             event_id = str(tag[1]).lower()
-            if len(event_id) != 64 or any(char not in "0123456789abcdef" for char in event_id):
+            if len(event_id) != 64 or any(
+                char not in "0123456789abcdef" for char in event_id
+            ):
                 continue
             if event_id not in seen:
                 seen.add(event_id)
@@ -1513,20 +1811,18 @@ class BuzzAdapter(BasePlatformAdapter):
             return ""
 
         async def fetch(event_id: str) -> Optional[dict]:
-            code, out, _err = await self._run_cli(
-                [
-                    "messages",
-                    "thread",
-                    "--channel",
-                    str(channel_id),
-                    "--event",
-                    event_id,
-                    "--limit",
-                    "1",
-                    "--depth-limit",
-                    "0",
-                ]
-            )
+            code, out, _err = await self._run_cli([
+                "messages",
+                "thread",
+                "--channel",
+                str(channel_id),
+                "--event",
+                event_id,
+                "--limit",
+                "1",
+                "--depth-limit",
+                "0",
+            ])
             if code != 0:
                 return None
             for candidate in _parse_json_list(out):
@@ -1669,11 +1965,16 @@ class BuzzAdapter(BasePlatformAdapter):
         """Latch a group conversation to chat_type="dm" once any direct
         message is seen; the classification then sticks so subsequent
         un-mentioned messages in the conversation dispatch too."""
-        if state["chat_type"] == "dm" or not self._is_direct_message_event(channel_id, event):
+        if state["chat_type"] == "dm" or not self._is_direct_message_event(
+            channel_id, event
+        ):
             return
         state["chat_type"] = "dm"
         self._channel_names.setdefault(channel_id, "DM")
-        logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
+        logger.info(
+            "Buzz: conversation %s reclassified as DM (message p-tagged to self)",
+            channel_id,
+        )
 
     def _is_mentioned(self, content: str) -> bool:
         """True when the message addresses this agent (npub, hex, or name)."""
@@ -1803,7 +2104,9 @@ class BuzzAdapter(BasePlatformAdapter):
             source=source,
             raw_message=raw_event,
             message_id=message_id,
-            timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            timestamp=datetime.fromtimestamp(created_at)
+            if created_at
+            else datetime.now(),
             channel_prompt=(
                 "You are handling an addressed Buzz message with observed Buzz group context. "
                 "Earlier Buzz messages may describe direct work "
@@ -1816,18 +2119,21 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event)
-        
+
         # Add a "seen" reaction after dispatching — signals to the user that
         # their message was received and is being processed.
         try:
             await self.send_reaction(chat_id, message_id, "👀")
         except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+            logger.debug(
+                "Buzz: reaction failed for message %s", message_id[:12], exc_info=True
+            )
 
 
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
+
 
 def check_requirements() -> bool:
     """Check if Buzz is configured: a relay URL plus a resolvable key."""
@@ -1922,7 +2228,9 @@ def _env_enablement() -> Optional[dict]:
         seed["cli_path"] = cli_path
     # Home channel for deliver=buzz cron jobs; defaults to the first watched
     # channel so env-only setups get a sensible target without extra config.
-    home = os.getenv("BUZZ_HOME_CHANNEL", "").strip() or (seed.get("channels") or [""])[0]
+    home = (
+        os.getenv("BUZZ_HOME_CHANNEL", "").strip() or (seed.get("channels") or [""])[0]
+    )
     if home:
         seed["home_channel"] = {
             "chat_id": home,
@@ -1953,12 +2261,18 @@ async def _standalone_send(
         os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
     )
     if not relay or not private_key:
-        return {"error": "Buzz standalone send: BUZZ_RELAY_URL and BUZZ_PRIVATE_KEY must be configured"}
+        return {
+            "error": "Buzz standalone send: BUZZ_RELAY_URL and BUZZ_PRIVATE_KEY must be configured"
+        }
     if not cli_path:
         return {"error": "Buzz standalone send: buzz CLI binary not found"}
-    target = (chat_id or "").strip() or (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
+    target = (chat_id or "").strip() or (
+        os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")
+    ).strip()
     if not target:
-        return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
+        return {
+            "error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"
+        }
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
     if thread_id:
@@ -1974,7 +2288,9 @@ async def _standalone_send(
     except OSError as e:
         return {"error": f"Buzz standalone send failed to launch CLI: {e}"}
     if code != 0:
-        return {"error": f"Buzz standalone send failed: {_cli_error_message(err, code)}"}
+        return {
+            "error": f"Buzz standalone send failed: {_cli_error_message(err, code)}"
+        }
     try:
         data = json.loads(out or "{}")
     except ValueError:
@@ -2006,8 +2322,12 @@ def interactive_setup() -> None:
         if not prompt_yes_no("Reconfigure Buzz?", False):
             return
 
-    print_info("Connect Hermes to a Buzz community (Block's Nostr-based human+agent platform).")
-    print_info("   Requires the buzz CLI binary and a Nostr key that is a community member.")
+    print_info(
+        "Connect Hermes to a Buzz community (Block's Nostr-based human+agent platform)."
+    )
+    print_info(
+        "   Requires the buzz CLI binary and a Nostr key that is a community member."
+    )
     print()
 
     relay = prompt(
@@ -2019,11 +2339,15 @@ def interactive_setup() -> None:
         return
     save_env_value("BUZZ_RELAY_URL", relay.strip())
 
-    key = prompt("Nostr private key (nsec or hex; leave blank to keep current)", password=True)
+    key = prompt(
+        "Nostr private key (nsec or hex; leave blank to keep current)", password=True
+    )
     if key:
         save_env_value("BUZZ_PRIVATE_KEY", key.strip())
     elif not _resolve_private_key():
-        print_warning("No private key configured — set BUZZ_PRIVATE_KEY before starting the gateway")
+        print_warning(
+            "No private key configured — set BUZZ_PRIVATE_KEY before starting the gateway"
+        )
 
     channels = prompt(
         "Channel UUIDs to watch (comma-separated, empty = all joined channels)",
@@ -2041,7 +2365,9 @@ def interactive_setup() -> None:
 
     print()
     print_info("🔒 Access control: restrict who can talk to the agent")
-    allow_all = prompt_yes_no("Allow all community members to talk to the agent?", False)
+    allow_all = prompt_yes_no(
+        "Allow all community members to talk to the agent?", False
+    )
     if allow_all:
         save_env_value("BUZZ_ALLOW_ALL_USERS", "true")
         save_env_value("BUZZ_ALLOWED_USERS", "")
@@ -2052,7 +2378,9 @@ def interactive_setup() -> None:
             "Allowed users (comma-separated npubs or hex pubkeys, empty to deny everyone)",
             default=get_env_value("BUZZ_ALLOWED_USERS") or "",
         )
-        save_env_value("BUZZ_ALLOWED_USERS", allowed.replace(" ", "") if allowed else "")
+        save_env_value(
+            "BUZZ_ALLOWED_USERS", allowed.replace(" ", "") if allowed else ""
+        )
 
     print()
     print_success("Buzz configuration saved to ~/.hermes/.env")
