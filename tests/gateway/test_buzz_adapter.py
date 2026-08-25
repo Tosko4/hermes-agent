@@ -72,7 +72,9 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    cfg = PlatformConfig(
+        enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})}
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
@@ -106,7 +108,6 @@ class _ScriptedCli:
 
 
 class TestBech32Helpers:
-
     def test_hex_to_npub_known_pair(self):
         assert hex_to_npub(SELF_PUBKEY) == SELF_NPUB
 
@@ -118,10 +119,9 @@ class TestBech32Helpers:
 
 
 class TestBuzzAdapterInit:
-
-
     def test_init_from_config_extra(self):
         from gateway.config import PlatformConfig
+
         cfg = PlatformConfig(
             enabled=True,
             extra={
@@ -164,7 +164,10 @@ class TestBuzzAdapterInit:
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
         from gateway.config import PlatformConfig
-        adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
+
+        adapter = BuzzAdapter(
+            PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"})
+        )
         assert adapter.relay_url == "https://env.relay"
 
 
@@ -172,9 +175,10 @@ class TestBuzzAdapterInit:
 
 
 class TestCliErrorContract:
-
     def test_parses_json_error(self):
-        msg = _cli_error_message('{"error":"relay_error","message":"boom","retryable":false}', 2)
+        msg = _cli_error_message(
+            '{"error":"relay_error","message":"boom","retryable":false}', 2
+        )
         assert "relay_error" in msg and "boom" in msg and "exit 2" in msg
 
 
@@ -182,7 +186,6 @@ class TestCliErrorContract:
 
 
 class TestPollingDedupe:
-
     @pytest.fixture
     def adapter(self):
         a = _make_adapter()
@@ -198,10 +201,14 @@ class TestPollingDedupe:
     @pytest.mark.asyncio
     async def test_seed_sets_high_water_mark_without_dispatch(self, adapter):
         cli = _ScriptedCli()
-        cli.script("messages", "get", [
-            _event("e1", content="@Chip old history", created_at=100),
-            _event("e2", content="@Chip newer history", created_at=200),
-        ])
+        cli.script(
+            "messages",
+            "get",
+            [
+                _event("e1", content="@Chip old history", created_at=100),
+                _event("e2", content="@Chip newer history", created_at=200),
+            ],
+        )
         adapter._run_cli = cli
         await adapter._seed_channel(CHANNEL, chat_type="group")
 
@@ -214,16 +221,22 @@ class TestPollingDedupe:
     @pytest.mark.asyncio
     async def test_new_event_dispatched_once(self, adapter):
         cli = _ScriptedCli()
-        cli.script("messages", "get", [_event("e1", content="@Chip hi", created_at=100)])
+        cli.script(
+            "messages", "get", [_event("e1", content="@Chip hi", created_at=100)]
+        )
         adapter._run_cli = cli
         await adapter._seed_channel(CHANNEL, chat_type="group")
 
         # Poll 1: seeded event + a genuinely new mention
         cli.responses.clear()
-        cli.script("messages", "get", [
-            _event("e1", content="@Chip hi", created_at=100),
-            _event("e2", content="hey @Chip, ping", created_at=150),
-        ])
+        cli.script(
+            "messages",
+            "get",
+            [
+                _event("e1", content="@Chip hi", created_at=100),
+                _event("e2", content="hey @Chip, ping", created_at=150),
+            ],
+        )
         await adapter._poll_channel(CHANNEL)
         assert [d["message_id"] for d in adapter._dispatched] == ["e2"]
         assert adapter._dispatched[0]["text"] == "hey @Chip, ping"
@@ -238,7 +251,6 @@ class TestPollingDedupe:
 
 
 class TestMentionGating:
-
     @pytest.fixture
     def adapter(self):
         a = _make_adapter()
@@ -260,23 +272,25 @@ class TestMentionGating:
 
     @pytest.mark.asyncio
     async def test_unaddressed_channel_message_ignored(self, adapter):
-        await self._poll_with(adapter, _event("e1", content="just chatting", created_at=10))
+        await self._poll_with(
+            adapter, _event("e1", content="just chatting", created_at=10)
+        )
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
-    async def test_unaddressed_specialist_message_is_observed_without_dispatch(self, adapter):
+    async def test_unaddressed_specialist_message_is_observed_without_dispatch(
+        self, adapter
+    ):
         adapter.observe_unaddressed_messages = True
         adapter._resolve_user_name = AsyncMock(return_value="Helper Bot")
         store = MagicMock()
         store.get_or_create_session.return_value.session_id = "session-root"
         adapter.set_session_store(store)
         event = _event("nested", content="@OtherAgent /status", created_at=10)
-        event["tags"].extend(
-            [
-                ["e", "outer-root", "", "root"],
-                ["e", "parent-reply", "", "reply"],
-            ]
-        )
+        event["tags"].extend([
+            ["e", "outer-root", "", "root"],
+            ["e", "parent-reply", "", "reply"],
+        ])
 
         await self._poll_with(adapter, event)
 
@@ -291,18 +305,24 @@ class TestMentionGating:
 
     @pytest.mark.asyncio
     async def test_name_mention_dispatched(self, adapter):
-        await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
+        await self._poll_with(
+            adapter, _event("e1", content="hey @Chip can you help?", created_at=10)
+        )
         assert len(adapter._dispatched) == 1
 
     @pytest.mark.asyncio
     async def test_plain_name_is_not_a_mention(self, adapter):
-        await self._poll_with(adapter, _event("e1", content="Chip can help with this", created_at=10))
+        await self._poll_with(
+            adapter, _event("e1", content="Chip can help with this", created_at=10)
+        )
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
     async def test_home_channel_does_not_require_a_mention(self, adapter):
         adapter.home_channel = CHANNEL
-        await self._poll_with(adapter, _event("e1", content="pick this up", created_at=10))
+        await self._poll_with(
+            adapter, _event("e1", content="pick this up", created_at=10)
+        )
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
 
     @pytest.mark.asyncio
@@ -319,19 +339,21 @@ class TestMentionGating:
         adapter._observe_unaddressed_message.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_home_channel_dispatches_when_primary_is_one_of_the_targets(self, adapter):
+    async def test_home_channel_dispatches_when_primary_is_one_of_the_targets(
+        self, adapter
+    ):
         adapter.home_channel = CHANNEL
         event = _event("e1", content="@Chip and @Cosmo coordinate", created_at=10)
-        event["tags"].extend(
-            [["p", SELF_PUBKEY], ["p", "b" * 64]]
-        )
+        event["tags"].extend([["p", SELF_PUBKEY], ["p", "b" * 64]])
 
         await self._poll_with(adapter, event)
 
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
 
     @pytest.mark.asyncio
-    async def test_home_channel_observes_specialist_result_without_dispatch(self, adapter):
+    async def test_home_channel_observes_specialist_result_without_dispatch(
+        self, adapter
+    ):
         adapter.home_channel = CHANNEL
         adapter.observe_unaddressed_messages = True
         adapter._allowed_pubkeys = {OTHER_PUBKEY}
@@ -362,11 +384,12 @@ class TestMentionGating:
         await self._poll_with(adapter, _event("e1", content="/status", created_at=10))
         assert [d["text"] for d in adapter._dispatched] == ["/status"]
 
-
     @pytest.mark.asyncio
     async def test_allowlist_blocks_unauthorized(self, adapter):
         adapter._allowed_pubkeys = {"b" * 64}
-        await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
+        await self._poll_with(
+            adapter, _event("e1", content="@Chip hello", created_at=10)
+        )
         assert adapter._dispatched == []
 
 
@@ -379,8 +402,17 @@ class TestMentionGating:
 # messages only ever p-tag us when the text visibly @mentions us.
 
 
-def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
-                  created_at=1000, kind=9, p=None, reply_to=None):
+def _tagged_event(
+    event_id,
+    channel,
+    *,
+    content,
+    pubkey=OTHER_PUBKEY,
+    created_at=1000,
+    kind=9,
+    p=None,
+    reply_to=None,
+):
     """Event with the tag shapes observed on a live relay (h/p/e tags)."""
     tags = [["h", channel]]
     if reply_to:
@@ -398,7 +430,6 @@ def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
 
 
 class TestDmClassification:
-
     @pytest.fixture
     def adapter(self):
         a = _make_adapter()
@@ -434,22 +465,30 @@ class TestDmClassification:
     async def test_unmentioned_ptagged_dm_latches_and_dispatches(self, adapter):
         """The reported bug: a DM without an @mention must dispatch."""
         await self._poll_with(
-            adapter, DM_CHANNEL,
-            _tagged_event("e1", DM_CHANNEL, content="here's a test message", p=SELF_PUBKEY),
+            adapter,
+            DM_CHANNEL,
+            _tagged_event(
+                "e1", DM_CHANNEL, content="here's a test message", p=SELF_PUBKEY
+            ),
         )
         assert adapter._channel_state[DM_CHANNEL]["chat_type"] == "dm"
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
         assert adapter._dispatched[0]["chat_type"] == "dm"
-
 
     @pytest.mark.asyncio
     async def test_general_reply_ptagging_self_stays_channel(self, adapter):
         """A #general reply to us p-tags our pubkey (observed live) — that
         must NOT reclassify the channel; mention gating still applies."""
         await self._poll_with(
-            adapter, CHANNEL,
-            _tagged_event("e1", CHANNEL, content="@chip what's up?",
-                          p=SELF_PUBKEY, reply_to="root-event"),
+            adapter,
+            CHANNEL,
+            _tagged_event(
+                "e1",
+                CHANNEL,
+                content="@chip what's up?",
+                p=SELF_PUBKEY,
+                reply_to="root-event",
+            ),
         )
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         # It carried a mention, so it dispatches — but as a group message.
@@ -458,25 +497,27 @@ class TestDmClassification:
         # And once the mention is absent, the channel gate drops the message
         # even though the earlier reply p-tagged us.
         await self._poll_with(
-            adapter, CHANNEL,
+            adapter,
+            CHANNEL,
             _tagged_event("e2", CHANNEL, content="thanks everyone", created_at=1001),
         )
         assert len(adapter._dispatched) == 1
 
-
     @pytest.mark.asyncio
-    async def test_channel_like_metadata_blocks_latch_even_without_mention(self, adapter):
+    async def test_channel_like_metadata_blocks_latch_even_without_mention(
+        self, adapter
+    ):
         """Second guard on its own: even a p-tagged, un-mentioned message
         cannot reclassify a conversation whose metadata says real channel."""
         adapter._channel_meta[CHANNEL]["description"] = ""
         adapter._channel_meta[CHANNEL]["name"] = "announcements"
         await self._poll_with(
-            adapter, CHANNEL,
+            adapter,
+            CHANNEL,
             _tagged_event("e1", CHANNEL, content="fyi everyone", p=SELF_PUBKEY),
         )
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         assert adapter._dispatched == []
-
 
     @pytest.mark.asyncio
     async def test_dm_shaped_channel_discovered_when_dms_list_empty(self):
@@ -486,11 +527,24 @@ class TestDmClassification:
         a = _make_adapter()
         cli = _ScriptedCli()
         cli.script("dms", "list", [])
-        cli.script("channels", "list", [
-            {"channel_id": DM_CHANNEL, "name": "DM", "description": "", "created_at": 1},
-            {"channel_id": CHANNEL, "name": "general",
-             "description": "General conversation and community updates.", "created_at": 2},
-        ])
+        cli.script(
+            "channels",
+            "list",
+            [
+                {
+                    "channel_id": DM_CHANNEL,
+                    "name": "DM",
+                    "description": "",
+                    "created_at": 1,
+                },
+                {
+                    "channel_id": CHANNEL,
+                    "name": "general",
+                    "description": "General conversation and community updates.",
+                    "created_at": 2,
+                },
+            ],
+        )
         a._run_cli = cli
         await a._discover_dms(seed=False)
         # Watched as group; the p-tag latch flips it on the first real DM.
@@ -504,9 +558,8 @@ class TestDmClassification:
 
 
 class TestThreadRouting:
-
-    def test_top_level_message_starts_session_at_own_event_id(self):
-        assert BuzzAdapter._thread_root_id(_event("root")) == "root"
+    def test_top_level_message_stays_in_channel_session(self):
+        assert BuzzAdapter._thread_root_id(_event("root")) is None
 
     def test_direct_reply_continues_root_session(self):
         event = _event("reply")
@@ -515,13 +568,121 @@ class TestThreadRouting:
 
     def test_nested_reply_prefers_outer_root_marker(self):
         event = _event("nested")
-        event["tags"].extend(
-            [
-                ["e", "root", "", "root"],
-                ["e", "reply", "", "reply"],
-            ]
-        )
+        event["tags"].extend([
+            ["e", "root", "", "root"],
+            ["e", "reply", "", "reply"],
+        ])
         assert BuzzAdapter._thread_root_id(event) == "root"
+
+    def test_quote_ids_are_ordered_deduplicated_and_validated(self):
+        first = "1" * 64
+        second = "2" * 64
+        event = _event("reply")
+        event["tags"].extend([
+            ["q", first],
+            ["q", "not-an-event"],
+            ["q", second],
+            ["q", first],
+        ])
+        assert BuzzAdapter._quoted_event_ids(event) == [first, second]
+
+    @pytest.mark.asyncio
+    async def test_lossless_long_message_attachment_is_verified_and_hydrated(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        payload = ("@Chip inspect every line\n" + "details\n" * 1024).encode()
+        digest = _buzz_mod.hashlib.sha256(payload).hexdigest()
+        event = _event(
+            "long",
+            content="The complete lossless message is attached as buzz-message.md.\n"
+            "[buzz-message.md](https://test.relay/media/blob)",
+        )
+        event["tags"].append([
+            "imeta",
+            "url https://test.relay/media/blob",
+            "m application/octet-stream",
+            f"x {digest}",
+            f"size {len(payload)}",
+            "filename buzz-message.md",
+        ])
+
+        async def download(args):
+            assert args == [
+                "media",
+                "get",
+                "https://test.relay/media/blob",
+                "--output",
+                "-",
+            ]
+            return 0, payload, ""
+
+        monkeypatch.setattr(adapter, "_run_cli_bytes", download)
+
+        hydrated = await adapter._hydrate_long_message_attachment(
+            event, event["content"]
+        )
+
+        assert hydrated == payload.decode()
+
+    @pytest.mark.asyncio
+    async def test_long_message_attachment_never_fetches_cross_origin(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        event = _event(
+            "long",
+            content="The complete lossless message is attached as buzz-message.md.",
+        )
+        event["tags"].append([
+            "imeta",
+            "url https://internal.example/media/blob",
+            f"x {'a' * 64}",
+            "size 12",
+            "filename buzz-message.md",
+        ])
+        called = False
+
+        async def forbidden(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("cross-origin fetch")
+
+        monkeypatch.setattr(adapter, "_run_cli_bytes", forbidden)
+
+        hydrated = await adapter._hydrate_long_message_attachment(
+            event, event["content"]
+        )
+
+        assert hydrated == event["content"]
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_selected_message_context_is_hydrated_without_changing_content(self):
+        adapter = _make_adapter()
+        first = "1" * 64
+        second = "2" * 64
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "thread",
+            [{"id": first, "pubkey": "a" * 64, "content": "first full message"}],
+        )
+        cli.script(
+            "messages",
+            "thread",
+            [{"id": second, "pubkey": "b" * 64, "content": "second full message"}],
+        )
+        adapter._run_cli = cli
+        event = _event("reply")
+        event["tags"].extend([["q", first], ["q", second]])
+
+        context = await adapter._load_quoted_context(CHANNEL, event)
+
+        assert "first full message" in context
+        assert "second full message" in context
+        assert len(cli.calls) == 2
+        assert all("--depth-limit" in args for args, _stdin in cli.calls)
 
     @pytest.mark.asyncio
     async def test_dispatch_carries_stable_thread_and_message_anchor(self):
@@ -539,12 +700,10 @@ class TestThreadRouting:
 
         adapter._dispatch_message = capture
         nested = _event("nested", content="continue", created_at=10)
-        nested["tags"].extend(
-            [
-                ["e", "root", "", "root"],
-                ["e", "reply", "", "reply"],
-            ]
-        )
+        nested["tags"].extend([
+            ["e", "root", "", "root"],
+            ["e", "reply", "", "reply"],
+        ])
 
         await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], nested)
 
@@ -554,16 +713,14 @@ class TestThreadRouting:
 
     @pytest.mark.asyncio
     async def test_dispatch_auto_loads_all_skills_bound_to_channel(self):
-        adapter = _make_adapter(
-            {
-                "channel_skill_bindings": [
-                    {
-                        "id": CHANNEL,
-                        "skills": ["research", "summarize", "research"],
-                    }
-                ]
-            }
-        )
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {
+                    "id": CHANNEL,
+                    "skills": ["research", "summarize", "research"],
+                }
+            ]
+        })
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
 
@@ -583,7 +740,6 @@ class TestThreadRouting:
 
 
 class TestLiveActivity:
-
     @pytest.mark.asyncio
     async def test_typing_heartbeat_is_thread_scoped_and_non_blocking(self):
         adapter = _make_adapter()
@@ -685,17 +841,23 @@ class TestLiveActivity:
 
         assert "--thread" not in cli.calls[0][0]
 
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
 class TestBuzzAdapterSend:
-
     @pytest.mark.asyncio
     async def test_send_success_via_stdin(self):
         adapter = _make_adapter()
-        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
         cli = _ScriptedCli()
-        cli.script("messages", "send", {"accepted": True, "event_id": "evt123", "message": ""})
+        cli.script(
+            "messages", "send", {"accepted": True, "event_id": "evt123", "message": ""}
+        )
         adapter._run_cli = cli
 
         result = await adapter.send(CHANNEL, "hello **markdown**")
@@ -710,6 +872,23 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_top_level_group_response_does_not_create_thread(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-top"})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "top-level response", reply_to="user-message")
+
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
 
     @pytest.mark.asyncio
     async def test_thread_root_wins_over_nested_reply_anchor(self):
@@ -731,6 +910,11 @@ class TestBuzzAdapterSend:
     @pytest.mark.asyncio
     async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
         adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "dm",
+            "last_ts": 0,
+            "seen": {},
+        }
         cli = _ScriptedCli()
         cli.script("messages", "send", {"accepted": True, "event_id": "evt125"})
         adapter._run_cli = cli
@@ -745,6 +929,31 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--reply-to") + 1] == "dm-message"
 
+    @pytest.mark.asyncio
+    async def test_edit_streams_content_via_stdin(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit-1"})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(
+            CHANNEL,
+            "original-message",
+            "partial response",
+        )
+
+        assert result.success is True
+        assert result.message_id == "original-message"
+        args, stdin_text = cli.calls[0]
+        assert args == [
+            "messages",
+            "edit",
+            "--event",
+            "original-message",
+            "--content",
+            "-",
+        ]
+        assert stdin_text == "partial response"
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -752,7 +961,9 @@ class TestBuzzAdapterSend:
         img.write_bytes(b"\x89PNG fake")
         adapter = _make_adapter()
         cli = _ScriptedCli()
-        cli.script("messages", "send", {"accepted": True, "event_id": "evt126", "message": ""})
+        cli.script(
+            "messages", "send", {"accepted": True, "event_id": "evt126", "message": ""}
+        )
         adapter._run_cli = cli
         result = await adapter.send_image(CHANNEL, str(img), caption="screenshot")
         assert result.success is True
@@ -836,10 +1047,13 @@ class TestBuzzAdapterLifecycle:
         )
         adapter = _make_adapter()
         adapter.cli_path = "/fake/buzz"
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test"
+        )
         cli = _ScriptedCli()
         cli.script(
-            "users", "get",
+            "users",
+            "get",
             [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}],
         )
         adapter._run_cli = cli
@@ -851,14 +1065,15 @@ class TestBuzzAdapterLifecycle:
 
 
 class TestCredentialResolution:
-
     def test_env_key_wins(self, monkeypatch):
         monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1fromenv")
         assert _resolve_private_key() == "nsec1fromenv"
 
     def test_credentials_file_fallback(self, monkeypatch, tmp_path):
         creds = tmp_path / "agent_credentials.json"
-        creds.write_text(json.dumps({"nsec": "nsec1fromfile", "npub": "npub1x"}), encoding="utf-8")
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "npub": "npub1x"}), encoding="utf-8"
+        )
         monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
         assert _resolve_private_key() == "nsec1fromfile"
 
@@ -867,13 +1082,11 @@ class TestCredentialResolution:
 
 
 class TestEnvEnablement:
-
     def test_returns_none_when_unconfigured(self):
         assert _env_enablement() is None
 
 
 class TestBuzzPluginRegistration:
-
     def test_register_platform_contract(self):
         from gateway.platform_registry import platform_registry
 
@@ -892,7 +1105,6 @@ class TestBuzzPluginRegistration:
 
 
 class TestStandaloneSend:
-
     @pytest.mark.asyncio
     async def test_standalone_send_success(self, monkeypatch, tmp_path):
         from gateway.config import PlatformConfig
@@ -905,13 +1117,23 @@ class TestStandaloneSend:
 
         captured = {}
 
-        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
-            captured.update(cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text)
-            return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0
+        ):
+            captured.update(
+                cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text
+            )
+            return (
+                0,
+                json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}),
+                "",
+            )
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
 
-        result = await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi")
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi"
+        )
         assert result == {"success": True, "message_id": "evt-cron"}
         assert captured["args"][:2] == ["messages", "send"]
         assert captured["input_text"] == "cron says hi"
