@@ -530,19 +530,23 @@ async def test_split_delivery_missing_tail_does_not_suppress():
 
 @pytest.mark.asyncio
 async def test_split_delivery_keeps_sealed_heads_on_fresh_final():
-    """The fresh-final route must not delete sealed head messages.
-
-    ``_try_fresh_final`` replaces every tracked preview with one fresh message,
-    which only holds the whole answer on a single-message turn.  After a split
-    the sealed heads carry text that the fresh message does not, so deleting
-    them would drop delivered content (#78541).
-    """
+    """A fresh final may replace only the active tail, never sealed heads."""
     adapter, consumer = _split_consumer()
     head_id = await consumer._send_new_chunk("HEAD text. " * 12, None, final=False)
     consumer._turn_split_delivery = True
+    # Mirror the real overflow transition: the head is sealed, then a new
+    # mutable tail becomes the current segment and edit target.
+    consumer._message_id = None
+    consumer._message_created_ts = None
+    consumer._last_sent_text = ""
+    consumer._segment_preview_message_ids = set()
+    assert await consumer._send_or_edit("TAIL preview") is True
+    tail_preview_id = consumer.message_id
 
     assert head_id in consumer._preview_message_ids
-    assert await consumer._try_fresh_final("TAIL text. " * 12) is False
+    assert await consumer._try_fresh_final("TAIL text. " * 12) is True
+    assert adapter.sent[-1]["content"] == "TAIL text. " * 12
+    assert tail_preview_id in adapter.deleted
     assert head_id not in adapter.deleted, "sealed head chunk was deleted"
 
 

@@ -425,6 +425,7 @@ class BuzzAdapter(BasePlatformAdapter):
     """
 
     supports_structured_tool_activity = True
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, config, **kwargs):
         platform = Platform("buzz")
@@ -811,6 +812,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    def prefers_fresh_final_streaming(
+        self, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Commit completed streamed replies as fresh immutable messages."""
+        return True
+
     async def send(
         self,
         chat_id: str,
@@ -894,6 +901,31 @@ class BuzzAdapter(BasePlatformAdapter):
             message_id=str(message_id),
             raw_response={**data, "edit_event_id": event_id},
         )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Publish a Buzz deletion event for one streamed preview message."""
+        if not message_id:
+            return False
+        code, out, err = await self._run_cli(
+            ["messages", "delete", "--event", str(message_id)]
+        )
+        if code != 0:
+            logger.debug(
+                "Buzz: failed to delete streamed preview %s — %s",
+                message_id,
+                _cli_error_message(err, code),
+            )
+            return False
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            return False
+        if not bool(data.get("accepted")):
+            return False
+        event_id = data.get("event_id")
+        if event_id:
+            self._mark_seen(str(chat_id), str(event_id))
+        return True
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Queue a short-lived Buzz typing heartbeat without blocking cadence."""

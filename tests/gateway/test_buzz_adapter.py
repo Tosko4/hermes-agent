@@ -846,6 +846,16 @@ class TestLiveActivity:
 
 
 class TestBuzzAdapterSend:
+    def test_prefers_fresh_final_streaming(self):
+        adapter = _make_adapter()
+
+        assert adapter.prefers_fresh_final_streaming("complete answer") is True
+
+    def test_requires_explicit_finalize_for_identical_cursorless_last_frame(self):
+        adapter = _make_adapter()
+
+        assert adapter.REQUIRES_EDIT_FINALIZE is True
+
     @pytest.mark.asyncio
     async def test_send_success_via_stdin(self):
         adapter = _make_adapter()
@@ -954,6 +964,20 @@ class TestBuzzAdapterSend:
             "-",
         ]
         assert stdin_text == "partial response"
+
+    @pytest.mark.asyncio
+    async def test_delete_message_publishes_buzz_deletion_event(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "delete", {"accepted": True, "event_id": "delete-1"})
+        adapter._run_cli = cli
+
+        deleted = await adapter.delete_message(CHANNEL, "original-message")
+
+        assert deleted is True
+        assert cli.calls == [
+            (["messages", "delete", "--event", "original-message"], None)
+        ]
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
