@@ -61,6 +61,108 @@ class TestFreshFinalForLongLivedPreviews:
 
 
     @pytest.mark.asyncio
+    async def test_opted_in_unsplit_stream_sends_fresh_final_and_deletes_preview(self):
+        adapter = _make_adapter()
+        adapter.prefers_fresh_final_streaming = MagicMock(return_value=True)
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="preview"),
+            SimpleNamespace(success=True, message_id="fresh_final"),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=5,
+                cursor=" ▉",
+            ),
+        )
+
+        consumer.on_delta("complete answer")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert [call.kwargs["content"] for call in adapter.send.call_args_list] == [
+            "complete answer ▉",
+            "complete answer",
+        ]
+        adapter.edit_message.assert_not_awaited()
+        adapter.delete_message.assert_awaited_once_with("chat", "preview")
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches("complete answer") is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_send_failure_falls_back_to_final_edit(self):
+        adapter = _make_adapter()
+        adapter.prefers_fresh_final_streaming = MagicMock(return_value=True)
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="preview"),
+            SimpleNamespace(success=False, message_id=None, error="send failed"),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=5,
+                cursor=" ▉",
+            ),
+        )
+
+        consumer.on_delta("complete answer")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert adapter.send.call_count == 2
+        adapter.edit_message.assert_awaited_once()
+        assert adapter.edit_message.await_args.kwargs == {
+            "chat_id": "chat",
+            "message_id": "preview",
+            "content": "complete answer",
+            "finalize": True,
+        }
+        adapter.delete_message.assert_not_awaited()
+        assert consumer.message_id == "preview"
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches("complete answer") is True
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_happens_after_fresh_send_and_keeps_success(self):
+        events = []
+        adapter = _make_adapter()
+        adapter.prefers_fresh_final_streaming = MagicMock(return_value=True)
+
+        async def send(**kwargs):
+            events.append(("send", kwargs["content"]))
+            message_id = "preview" if len(events) == 1 else "fresh_final"
+            return SimpleNamespace(success=True, message_id=message_id)
+
+        async def delete(chat_id, message_id):
+            events.append(("delete", message_id))
+            raise RuntimeError("cleanup unavailable")
+
+        adapter.send.side_effect = send
+        adapter.delete_message.side_effect = delete
+        consumer = GatewayStreamConsumer(adapter=adapter, chat_id="chat")
+
+        assert await consumer._send_or_edit("partial") is True
+        assert await consumer._send_or_edit("complete", finalize=True) is True
+
+        assert events == [
+            ("send", "partial"),
+            ("send", "complete"),
+            ("delete", "preview"),
+        ]
+        assert consumer.message_id == "fresh_final"
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
     async def test_fresh_final_without_delete_support_is_best_effort(self):
         """Adapter lacking ``delete_message`` still gets the fresh send."""
         adapter = _make_adapter(supports_delete=False)
@@ -80,6 +182,56 @@ class TestFreshFinalForLongLivedPreviews:
         adapter.edit_message.assert_not_called()
         # No delete attempt — just the fresh send.
         assert consumer._message_id == "fresh_final"
+
+
+class TestFreshFinalOverflow:
+    @pytest.mark.asyncio
+    async def test_split_stream_fresh_sends_complete_tail_and_keeps_sealed_head(self):
+        adapter = _make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 650
+        adapter.prefers_fresh_final_streaming = MagicMock(return_value=True)
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id="head_preview"),
+            SimpleNamespace(success=True, message_id="sealed_head"),
+            SimpleNamespace(success=True, message_id="tail_preview"),
+            SimpleNamespace(success=True, message_id="final_tail"),
+        ]
+        consumer = GatewayStreamConsumer(
+            adapter=adapter,
+            chat_id="chat",
+            config=StreamConsumerConfig(
+                edit_interval=0.01,
+                buffer_threshold=5,
+                cursor=" ▉",
+            ),
+        )
+        first_delta = "A" * 400
+        second_delta = "B" * 400
+
+        consumer.on_delta(first_delta)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.on_delta(second_delta)
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        immutable_sends = [
+            call
+            for call in adapter.send.call_args_list
+            if call.kwargs.get("metadata", {}).get("notify")
+            and not call.kwargs.get("metadata", {}).get("expect_edits")
+        ]
+        assert "".join(call.kwargs["content"] for call in immutable_sends) == (
+            first_delta + second_delta
+        )
+        deleted_ids = {call.args[1] for call in adapter.delete_message.await_args_list}
+        assert "tail_preview" in deleted_ids
+        assert "sealed_head" not in deleted_ids
+        assert consumer.message_id == "final_tail"
+        assert consumer.final_response_sent is True
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches(first_delta + second_delta) is True
 
 
 class TestSegmentBreakDoesNotMarkFinalSent:

@@ -1078,11 +1078,12 @@ class GatewayStreamConsumer:
                         if all_heads_delivered:
                             self._accumulated = chunks[-1]
                             # The head chunks are sealed.  Clear the edit target
-                            # so the remaining tail is sent as a fresh active
-                            # chunk, then edited by subsequent deltas.
+                            # and segment preview ids so fresh-final cleanup for
+                            # the remaining tail cannot delete immutable heads.
                             self._message_id = None
                             self._message_created_ts = None
                             self._last_sent_text = ""
+                            self._segment_preview_message_ids = set()
                         else:
                             # A prior head may have landed before a later head
                             # failed.  Do not edit that sealed message with the
@@ -1173,6 +1174,7 @@ class GatewayStreamConsumer:
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
+                        self._segment_preview_message_ids = set()
                         # Sealed head chunk delivered — this turn is now a
                         # multi-message delivery (#71643 record semantics).
                         self._turn_split_delivery = True
@@ -2215,20 +2217,15 @@ class GatewayStreamConsumer:
 
         Ported from openclaw/openclaw#72038.
         """
-        # Every preview message the user has seen for this response: the
-        # current one plus any continuation fragments tracked while streaming
-        # (an oversized reply split across the platform's edit limit).  All of
-        # them are replaced by the single fresh message below.
-        #
-        # That replacement is only sound while ``text`` holds the whole answer.
-        # On a multi-message split the head chunks were sealed and dropped out
-        # of ``_accumulated``, so ``text`` is just the tail — deleting the
-        # sealed heads would erase text the user already received and leave the
-        # complete reply nowhere on screen (#78541).  Keep the sealed messages
-        # and take the normal edit path instead.
-        if self._turn_split_delivery:
-            return False
-        stale_ids = set(self._preview_message_ids)
+        # For an unsplit response the fresh message replaces every preview the
+        # response created.  Once overflow has sealed one or more head chunks,
+        # ``text`` is only the complete active tail: replace only that segment's
+        # previews and leave the immutable heads on screen.
+        stale_ids = set(
+            self._segment_preview_message_ids
+            if self._turn_split_delivery
+            else self._preview_message_ids
+        )
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
@@ -2264,7 +2261,11 @@ class GatewayStreamConsumer:
                         "Fresh-final preview cleanup failed (%s): %s",
                         stale_id, e,
                     )
-        self._preview_message_ids = set()
+        if self._turn_split_delivery:
+            self._segment_preview_message_ids = set()
+        else:
+            self._preview_message_ids = set()
+            self._segment_preview_message_ids = set()
         if new_message_id:
             self._message_id = new_message_id
             self._message_created_ts = time.monotonic()
@@ -2533,6 +2534,9 @@ class GatewayStreamConsumer:
                             # turn is a multi-message delivery (#71643).
                             self._turn_split_delivery = True
                             self._message_id = str(result.message_id)
+                            # The adopted last continuation is the mutable tail;
+                            # the original and earlier continuations are sealed.
+                            self._segment_preview_message_ids = {self._message_id}
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
                             self._notify_new_message()
