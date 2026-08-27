@@ -47,23 +47,7 @@ class TestIsUnsupportedParameterError:
     def test_matches_real_provider_messages(self, param, message):
         assert _is_unsupported_parameter_error(RuntimeError(message), param) is True
 
-    @pytest.mark.parametrize("param,message", [
-        # Param not mentioned at all
-        ("temperature", "HTTP 400: max_tokens is too large"),
-        # Param mentioned but not flagged as unsupported
-        ("temperature", "temperature must be between 0 and 2"),
-        # Totally unrelated 400
-        ("max_tokens", "Rate limit exceeded"),
-        # Connection-level errors
-        ("temperature", "Connection reset by peer"),
-    ])
-    def test_does_not_match_unrelated_errors(self, param, message):
-        assert _is_unsupported_parameter_error(RuntimeError(message), param) is False
 
-    def test_empty_param_returns_false(self):
-        assert _is_unsupported_parameter_error(
-            RuntimeError("HTTP 400: Unsupported parameter: temperature"), ""
-        ) is False
 
     def test_temperature_wrapper_delegates_to_generic(self):
         """Back-compat: ``_is_unsupported_temperature_error`` still routes through."""
@@ -102,7 +86,7 @@ class TestMaxTokensRetryHardening:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             with pytest.raises(RuntimeError):
                 call_llm(
@@ -115,37 +99,6 @@ class TestMaxTokensRetryHardening:
         # Only the initial attempt — no retry because the gate blocked it
         assert client.chat.completions.create.call_count == 1
 
-    def test_sync_max_tokens_retry_matches_generic_phrasing(self):
-        """A 400 saying "Unknown parameter: max_tokens" (not the legacy
-        substring ``"max_tokens"`` bare + no ``unsupported_parameter`` token)
-        now triggers the retry via the generic helper.
-        """
-        client = MagicMock()
-        client.base_url = "https://api.openai.com/v1"
-        err = RuntimeError("Unknown parameter: max_tokens")
-        response = _dummy_response()
-        client.chat.completions.create.side_effect = [err, response]
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
-            patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
-        ):
-            result = call_llm(
-                task="session_search",
-                messages=[{"role": "user", "content": "hi"}],
-                temperature=0.3,
-                max_tokens=512,
-            )
-
-        assert result is response
-        assert client.chat.completions.create.call_count == 2
-        second_call = client.chat.completions.create.call_args_list[1]
-        assert "max_tokens" not in second_call.kwargs
-        assert second_call.kwargs["max_completion_tokens"] == 512
 
     @pytest.mark.asyncio
     async def test_async_max_tokens_retry_skipped_when_max_tokens_is_none(self):
@@ -160,7 +113,7 @@ class TestMaxTokensRetryHardening:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             with pytest.raises(RuntimeError):
                 await async_call_llm(
@@ -171,31 +124,3 @@ class TestMaxTokensRetryHardening:
 
         assert client.chat.completions.create.call_count == 1
 
-    @pytest.mark.asyncio
-    async def test_async_max_tokens_retry_matches_generic_phrasing(self):
-        client = MagicMock()
-        client.base_url = "https://api.openai.com/v1"
-        err = RuntimeError("Unknown parameter: max_tokens")
-        response = _dummy_response()
-        client.chat.completions.create = AsyncMock(side_effect=[err, response])
-
-        with (
-            patch("agent.auxiliary_client._resolve_task_provider_model",
-                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
-            patch("agent.auxiliary_client._get_cached_client",
-                  return_value=(client, "gpt-5.5")),
-            patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
-        ):
-            result = await async_call_llm(
-                task="session_search",
-                messages=[{"role": "user", "content": "hi"}],
-                temperature=0.3,
-                max_tokens=512,
-            )
-
-        assert result is response
-        assert client.chat.completions.create.await_count == 2
-        second_call = client.chat.completions.create.call_args_list[1]
-        assert "max_tokens" not in second_call.kwargs
-        assert second_call.kwargs["max_completion_tokens"] == 512

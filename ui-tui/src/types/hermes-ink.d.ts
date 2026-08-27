@@ -28,7 +28,7 @@ declare module '@hermes/ink' {
   export type InputEvent = {
     readonly input: string
     readonly key: Key
-    readonly keypress: { readonly raw?: string }
+    readonly keypress: { readonly isPasted?: boolean; readonly raw?: string }
   }
 
   export type InputHandler = (input: string, key: Key, event: InputEvent) => void
@@ -66,6 +66,7 @@ declare module '@hermes/ink' {
     readonly exitOnCtrlC?: boolean
     readonly patchConsole?: boolean
     readonly onFrame?: (event: FrameEvent) => void
+    readonly onHyperlinkClick?: (url: string) => void
   }
 
   export type Instance = {
@@ -76,6 +77,7 @@ declare module '@hermes/ink' {
   }
 
   export type ScrollBoxHandle = {
+    readonly adjustScrollTop: (dy: number) => void
     readonly scrollTo: (y: number) => void
     readonly scrollBy: (dy: number) => void
     readonly scrollToElement: (el: unknown, offset?: number) => void
@@ -83,6 +85,7 @@ declare module '@hermes/ink' {
     readonly getScrollTop: () => number
     readonly getPendingDelta: () => number
     readonly getScrollHeight: () => number
+    readonly getFreshScrollHeight: () => number
     readonly getViewportHeight: () => number
     readonly getViewportTop: () => number
     readonly getLastManualScrollAt: () => number
@@ -102,9 +105,16 @@ declare module '@hermes/ink' {
   export const NoSelect: React.ComponentType<any>
   export const ScrollBox: React.ComponentType<any>
   export const Text: React.ComponentType<any>
+  export function setDimFallbackColor(color: string | undefined): void
   export const TextInput: React.ComponentType<any>
+  export const colorize: (str: string, color: string | undefined, type: 'foreground' | 'background') => string
   export const stringWidth: (s: string) => number
   export function isXtermJs(): boolean
+  export function onTerminalBackground(listener: (hex: string) => void): void
+  export function terminalBackgroundHex(): string | undefined
+  export function onTerminalForeground(listener: (hex: string) => void): void
+  export function terminalForegroundHex(): string | undefined
+  export function parseOscColor(data: string): string | undefined
 
   export type ScrollFastPathStats = {
     captured: number
@@ -131,6 +141,7 @@ declare module '@hermes/ink' {
   }
   export function evictInkCaches(level?: EvictLevel): InkCacheSizes
 
+  export function forceRedraw(stdout?: NodeJS.WriteStream): boolean
   export function render(node: React.ReactNode, options?: NodeJS.WriteStream | RenderOptions): Instance
 
   export function useApp(): { readonly exit: (error?: Error) => void }
@@ -144,6 +155,7 @@ declare module '@hermes/ink' {
     readonly clearSelection: () => void
     readonly hasSelection: () => boolean
     readonly getState: () => unknown
+    readonly version: () => number
     readonly subscribe: (cb: () => void) => () => void
     readonly shiftAnchor: (dRow: number, minRow: number, maxRow: number) => void
     readonly shiftSelection: (dRow: number, minRow: number, maxRow: number) => void
@@ -152,14 +164,22 @@ declare module '@hermes/ink' {
     readonly setSelectionBgColor: (color: string) => void
   }
   export function useHasSelection(): boolean
-  export function useStdout(): { readonly stdout?: NodeJS.WriteStream }
+  export function useStdout(): {
+    readonly stdout?: NodeJS.WriteStream
+    readonly write: (data: string) => boolean
+  }
   export function useTerminalFocus(): boolean
-  export function useTerminalTitle(title: string | null): void
+  export function useTerminalTitle(title: string | TerminalTitlePair | null): void
+  export interface TerminalTitlePair {
+    tab?: string
+    window?: string
+  }
   export function useDeclaredCursor(args: {
     readonly line: number
     readonly column: number
     readonly active: boolean
   }): (el: unknown) => void
+  export function useCursorAdvance(): (dx: number, dy?: number) => void
   export function useStdin(): {
     readonly stdin: NodeJS.ReadStream
     readonly setRawMode: (value: boolean) => void
