@@ -311,6 +311,57 @@ class TestMentionGating:
         assert len(adapter._dispatched) == 1
 
     @pytest.mark.asyncio
+    async def test_addressed_forum_post_dispatches_with_post_as_thread_root(
+        self, adapter
+    ):
+        post_id = "f" * 64
+        await self._poll_with(
+            adapter,
+            _event(
+                post_id,
+                content="@Chip investigate this topic",
+                created_at=10,
+                kind=45001,
+            ),
+        )
+
+        assert adapter._channel_state[CHANNEL]["forum"] is True
+        assert [d["message_id"] for d in adapter._dispatched] == [post_id]
+        assert adapter._dispatched[0]["thread_id"] == post_id
+
+    @pytest.mark.asyncio
+    async def test_addressed_forum_comment_uses_outer_post_root(self, adapter):
+        post_id = "a" * 64
+        comment = _event(
+            "c" * 64,
+            content="@Chip follow up",
+            created_at=11,
+            kind=45003,
+        )
+        comment["tags"].extend([
+            ["e", post_id, "", "root"],
+            ["e", "b" * 64, "", "reply"],
+        ])
+
+        await self._poll_with(adapter, comment)
+
+        assert [d["thread_id"] for d in adapter._dispatched] == [post_id]
+
+    @pytest.mark.asyncio
+    async def test_structured_stream_message_is_not_silently_dropped(self, adapter):
+        await self._poll_with(
+            adapter,
+            _event(
+                "2" * 64,
+                content="@Chip structured stream message",
+                created_at=12,
+                kind=40002,
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["2" * 64]
+
+    @pytest.mark.asyncio
     async def test_plain_name_is_not_a_mention(self, adapter):
         await self._poll_with(
             adapter, _event("e1", content="Chip can help with this", created_at=10)
@@ -918,6 +969,31 @@ class TestBuzzAdapterSend:
         assert args[args.index("--reply-to") + 1] == "outer-root"
 
     @pytest.mark.asyncio
+    async def test_forum_response_uses_comment_kind_and_canonical_root(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "forum": True,
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "forum-reply"})
+        adapter._run_cli = cli
+        post_id = "a" * 64
+
+        await adapter.send(
+            CHANNEL,
+            "forum response",
+            reply_to="nested-comment",
+            metadata={"thread_id": post_id},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == post_id
+        assert args[args.index("--kind") + 1] == "45003"
+
+    @pytest.mark.asyncio
     async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {
@@ -993,6 +1069,35 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_forum_image_reply_uses_comment_kind_and_root(self, tmp_path):
+        img = tmp_path / "forum-shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "forum": True,
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "image-reply"})
+        adapter._run_cli = cli
+        post_id = "a" * 64
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="evidence",
+            reply_to="nested-comment",
+            metadata={"thread_id": post_id},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == post_id
+        assert args[args.index("--kind") + 1] == "45003"
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────

@@ -97,10 +97,23 @@ from gateway.platforms.base import (
 from gateway.config import Platform
 
 
-# Buzz chat messages are Nostr kind 9 events.  ``buzz messages get`` also
-# returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
-# dispatched to the agent.
-_CHAT_KIND = 9
+# Buzz conversation events span the legacy stream kind, the structured stream
+# kind, diffs, and the forum post/comment pair. ``buzz messages get`` returns
+# exactly this user-visible set alongside no housekeeping kinds. Keep the
+# native WebSocket subscription and the shared dispatch gate aligned with the
+# CLI or an addressed forum topic can be stored perfectly while the agent never
+# sees it.
+_STREAM_MESSAGE_KINDS = (9, 40002)
+_STREAM_DIFF_KIND = 40008
+_FORUM_POST_KIND = 45001
+_FORUM_COMMENT_KIND = 45003
+_CONVERSATION_KINDS = (
+    *_STREAM_MESSAGE_KINDS,
+    _STREAM_DIFF_KIND,
+    _FORUM_POST_KIND,
+    _FORUM_COMMENT_KIND,
+)
+_FORUM_KINDS = (_FORUM_POST_KIND, _FORUM_COMMENT_KIND)
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
@@ -551,7 +564,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
         self._lock_key: Optional[str] = None
-        # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
+        # channel_id -> {"chat_type", "forum", "last_ts",
+        #                "seen": OrderedDict[event_id, None]}
         self._channel_state: Dict[str, dict] = {}
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
@@ -841,6 +855,8 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_target = thread_id or (reply_to if chat_type != "group" else None)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+            if self._channel_state.get(str(chat_id), {}).get("forum"):
+                args += ["--kind", str(_FORUM_COMMENT_KIND)]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -906,9 +922,12 @@ class BuzzAdapter(BasePlatformAdapter):
         """Publish a Buzz deletion event for one streamed preview message."""
         if not message_id:
             return False
-        code, out, err = await self._run_cli(
-            ["messages", "delete", "--event", str(message_id)]
-        )
+        code, out, err = await self._run_cli([
+            "messages",
+            "delete",
+            "--event",
+            str(message_id),
+        ])
         if code != 0:
             logger.debug(
                 "Buzz: failed to delete streamed preview %s — %s",
@@ -1179,8 +1198,15 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--content",
                 "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            thread_id = (metadata or {}).get("thread_id")
+            chat_type = str(
+                self._channel_state.get(str(chat_id), {}).get("chat_type") or ""
+            )
+            reply_target = thread_id or (reply_to if chat_type != "group" else None)
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
+                if self._channel_state.get(str(chat_id), {}).get("forum"):
+                    args += ["--kind", str(_FORUM_COMMENT_KIND)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(
@@ -1311,7 +1337,7 @@ class BuzzAdapter(BasePlatformAdapter):
         request = [
             "REQ",
             subscription_id,
-            {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
+            {"kinds": list(_CONVERSATION_KINDS), "#h": [channel_id], "since": since},
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
 
@@ -1479,7 +1505,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
         """Initialize a channel's high-water mark from its newest events."""
-        state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
+        state = {
+            "chat_type": chat_type,
+            "forum": False,
+            "last_ts": 0,
+            "seen": OrderedDict(),
+        }
         self._channel_state[channel_id] = state
         code, out, err = await self._run_cli([
             "messages",
@@ -1505,6 +1536,7 @@ class BuzzAdapter(BasePlatformAdapter):
             if event_id:
                 state["seen"][str(event_id)] = None
             state["last_ts"] = max(state["last_ts"], created_at)
+            self._note_channel_kind(state, event)
             # History is never dispatched, but it still classifies: a DM that
             # leaked in via ``channels list`` latches to chat_type="dm" here,
             # so it bypasses the mention gate from the very first poll.
@@ -1556,6 +1588,7 @@ class BuzzAdapter(BasePlatformAdapter):
             else:
                 self._channel_state[ch_id] = {
                     "chat_type": "group",
+                    "forum": False,
                     "last_ts": 0,
                     "seen": OrderedDict(),
                 }
@@ -1597,8 +1630,10 @@ class BuzzAdapter(BasePlatformAdapter):
         state["seen"][event_id] = None
         state["last_ts"] = max(state["last_ts"], created_at)
 
-        if int(event.get("kind") or 0) != _CHAT_KIND:
+        event_kind = int(event.get("kind") or 0)
+        if event_kind not in _CONVERSATION_KINDS:
             return
+        self._note_channel_kind(state, event)
         pubkey = str(event.get("pubkey") or "").lower()
         content = event.get("content")
         if not pubkey or not isinstance(content, str) or not content.strip():
@@ -1782,11 +1817,18 @@ class BuzzAdapter(BasePlatformAdapter):
     def _thread_root_id(event: dict) -> Optional[str]:
         """Return one stable Buzz conversation id from NIP-10 tags.
 
-        Top-level channel messages have no thread id and share the channel
-        session. Direct replies may carry only a reply marker; nested replies
-        carry explicit root + reply markers. The outer root always wins, so
-        every message in an explicitly created thread continues one session.
+        Top-level stream messages have no thread id and share the channel
+        session. A forum post is itself the durable topic root. Direct replies
+        may carry only a reply marker; nested replies carry explicit root +
+        reply markers. The outer root always wins, so every message in an
+        explicitly created stream thread or forum topic continues one session.
         """
+        if int(event.get("kind") or 0) == _FORUM_POST_KIND:
+            event_id = str(event.get("id") or "")
+            if len(event_id) == 64 and all(
+                c in "0123456789abcdef" for c in event_id.lower()
+            ):
+                return event_id
         tags = event.get("tags")
         if isinstance(tags, list):
             for tag in tags:
@@ -1807,6 +1849,17 @@ class BuzzAdapter(BasePlatformAdapter):
                 ):
                     return str(tag[1])
         return None
+
+    @staticmethod
+    def _note_channel_kind(state: dict, event: dict) -> None:
+        """Latch forum routing after observing any forum post/comment.
+
+        ``channels list`` currently does not expose the stream/forum type to
+        the adapter. The signed event kind is authoritative and lets outbound
+        replies use kind 45003 without inventing deployment-only metadata.
+        """
+        if int(event.get("kind") or 0) in _FORUM_KINDS:
+            state["forum"] = True
 
     @staticmethod
     def _quoted_event_ids(event: dict) -> list[str]:
@@ -1973,7 +2026,7 @@ class BuzzAdapter(BasePlatformAdapter):
         not the artifact of a typed @mention (see block comment above)."""
         if not self._self_pubkey or not self._may_reclassify_as_dm(channel_id):
             return False
-        if int(event.get("kind") or 0) != _CHAT_KIND:
+        if int(event.get("kind") or 0) not in _STREAM_MESSAGE_KINDS:
             return False
         pubkey = str(event.get("pubkey") or "").lower()
         if not pubkey or pubkey == self._self_pubkey:

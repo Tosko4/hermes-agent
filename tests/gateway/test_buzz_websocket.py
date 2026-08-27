@@ -34,7 +34,9 @@ CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    cfg = PlatformConfig(
+        enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})}
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._private_key = TEST_PRIVATE_KEY
@@ -105,6 +107,25 @@ class _FakeWebSocket:
 
 
 @pytest.mark.asyncio
+async def test_channel_subscription_includes_stream_and_forum_messages():
+    adapter = _make_adapter()
+    adapter._channel_state[CHANNEL] = {
+        "chat_type": "group",
+        "forum": False,
+        "last_ts": 123,
+        "seen": {},
+    }
+    websocket = _FakeWebSocket()
+
+    await adapter._send_channel_subscription(websocket, "buzz-channel", CHANNEL)
+
+    request = websocket.sent[0]
+    assert request[:2] == ["REQ", "buzz-channel"]
+    assert request[2]["kinds"] == [9, 40002, 40008, 45001, 45003]
+    assert request[2]["#h"] == [CHANNEL]
+
+
+@pytest.mark.asyncio
 async def test_websocket_auth_raises_on_rejection():
     adapter = _make_adapter()
 
@@ -117,5 +138,3 @@ async def test_websocket_auth_raises_on_rejection():
 
     with pytest.raises(ConnectionError):
         await adapter._authenticate_websocket(RejectingWs())
-
-
