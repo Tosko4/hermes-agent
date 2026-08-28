@@ -46,6 +46,10 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_TERMINAL_ENABLED",
+    "BUZZ_TERMINAL_CHANNEL",
+    "BUZZ_TERMINAL_ALLOWED_USERS",
+    "BUZZ_TERMINAL_CWD",
 )
 
 
@@ -119,6 +123,10 @@ class TestBech32Helpers:
 
 
 class TestBuzzAdapterInit:
+    def test_terminal_broker_loads_under_single_file_plugin_loader(self):
+        broker_type = _buzz_mod._load_terminal_broker()
+        assert broker_type.__name__ == "TerminalBroker"
+
     def test_init_from_config_extra(self):
         from gateway.config import PlatformConfig
 
@@ -132,6 +140,10 @@ class TestBuzzAdapterInit:
                 "require_mention": True,
                 "accept_bare_slash_commands": True,
                 "observe_unaddressed_messages": True,
+                "terminal_enabled": True,
+                "terminal_channel": CHANNEL,
+                "terminal_allowed_users": [OTHER_PUBKEY],
+                "terminal_cwd": "/tmp",
             },
         )
         adapter = BuzzAdapter(cfg)
@@ -142,6 +154,10 @@ class TestBuzzAdapterInit:
         assert adapter.require_mention is True
         assert adapter.accept_bare_slash_commands is True
         assert adapter.observe_unaddressed_messages is True
+        assert adapter.terminal_enabled is True
+        assert adapter.terminal_channel == CHANNEL
+        assert adapter._terminal_allowed_pubkeys == {OTHER_PUBKEY}
+        assert adapter.terminal_cwd == "/tmp"
 
     def test_primary_agent_behavior_stays_profile_scoped(self, monkeypatch):
         monkeypatch.setenv("BUZZ_ACCEPT_BARE_SLASH_COMMANDS", "true")
@@ -309,6 +325,57 @@ class TestMentionGating:
             adapter, _event("e1", content="hey @Chip can you help?", created_at=10)
         )
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_addressed_forum_post_dispatches_with_post_as_thread_root(
+        self, adapter
+    ):
+        post_id = "f" * 64
+        await self._poll_with(
+            adapter,
+            _event(
+                post_id,
+                content="@Chip investigate this topic",
+                created_at=10,
+                kind=45001,
+            ),
+        )
+
+        assert adapter._channel_state[CHANNEL]["forum"] is True
+        assert [d["message_id"] for d in adapter._dispatched] == [post_id]
+        assert adapter._dispatched[0]["thread_id"] == post_id
+
+    @pytest.mark.asyncio
+    async def test_addressed_forum_comment_uses_outer_post_root(self, adapter):
+        post_id = "a" * 64
+        comment = _event(
+            "c" * 64,
+            content="@Chip follow up",
+            created_at=11,
+            kind=45003,
+        )
+        comment["tags"].extend([
+            ["e", post_id, "", "root"],
+            ["e", "b" * 64, "", "reply"],
+        ])
+
+        await self._poll_with(adapter, comment)
+
+        assert [d["thread_id"] for d in adapter._dispatched] == [post_id]
+
+    @pytest.mark.asyncio
+    async def test_structured_stream_message_is_not_silently_dropped(self, adapter):
+        await self._poll_with(
+            adapter,
+            _event(
+                "2" * 64,
+                content="@Chip structured stream message",
+                created_at=12,
+                kind=40002,
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["2" * 64]
 
     @pytest.mark.asyncio
     async def test_plain_name_is_not_a_mention(self, adapter):
@@ -918,6 +985,31 @@ class TestBuzzAdapterSend:
         assert args[args.index("--reply-to") + 1] == "outer-root"
 
     @pytest.mark.asyncio
+    async def test_forum_response_uses_comment_kind_and_canonical_root(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "forum": True,
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "forum-reply"})
+        adapter._run_cli = cli
+        post_id = "a" * 64
+
+        await adapter.send(
+            CHANNEL,
+            "forum response",
+            reply_to="nested-comment",
+            metadata={"thread_id": post_id},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == post_id
+        assert args[args.index("--kind") + 1] == "45003"
+
+    @pytest.mark.asyncio
     async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {
@@ -993,6 +1085,35 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_forum_image_reply_uses_comment_kind_and_root(self, tmp_path):
+        img = tmp_path / "forum-shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "forum": True,
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "image-reply"})
+        adapter._run_cli = cli
+        post_id = "a" * 64
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="evidence",
+            reply_to="nested-comment",
+            metadata={"thread_id": post_id},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == post_id
+        assert args[args.index("--kind") + 1] == "45003"
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
