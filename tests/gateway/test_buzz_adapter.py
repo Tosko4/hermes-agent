@@ -46,6 +46,10 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_TERMINAL_ENABLED",
+    "BUZZ_TERMINAL_CHANNEL",
+    "BUZZ_TERMINAL_ALLOWED_USERS",
+    "BUZZ_TERMINAL_CWD",
 )
 
 
@@ -119,6 +123,10 @@ class TestBech32Helpers:
 
 
 class TestBuzzAdapterInit:
+    def test_terminal_broker_loads_under_single_file_plugin_loader(self):
+        broker_type = _buzz_mod._load_terminal_broker()
+        assert broker_type.__name__ == "TerminalBroker"
+
     def test_init_from_config_extra(self):
         from gateway.config import PlatformConfig
 
@@ -132,6 +140,10 @@ class TestBuzzAdapterInit:
                 "require_mention": True,
                 "accept_bare_slash_commands": True,
                 "observe_unaddressed_messages": True,
+                "terminal_enabled": True,
+                "terminal_channel": CHANNEL,
+                "terminal_allowed_users": [OTHER_PUBKEY],
+                "terminal_cwd": "/tmp",
             },
         )
         adapter = BuzzAdapter(cfg)
@@ -142,6 +154,10 @@ class TestBuzzAdapterInit:
         assert adapter.require_mention is True
         assert adapter.accept_bare_slash_commands is True
         assert adapter.observe_unaddressed_messages is True
+        assert adapter.terminal_enabled is True
+        assert adapter.terminal_channel == CHANNEL
+        assert adapter._terminal_allowed_pubkeys == {OTHER_PUBKEY}
+        assert adapter.terminal_cwd == "/tmp"
 
     def test_primary_agent_behavior_stays_profile_scoped(self, monkeypatch):
         monkeypatch.setenv("BUZZ_ACCEPT_BARE_SLASH_COMMANDS", "true")

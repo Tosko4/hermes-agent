@@ -126,6 +126,27 @@ async def test_channel_subscription_includes_stream_and_forum_messages():
 
 
 @pytest.mark.asyncio
+async def test_terminal_subscription_is_owner_private_control_only():
+    adapter = _make_adapter()
+    adapter._terminal_broker = object()
+    websocket = _FakeWebSocket()
+
+    subscriptions = await adapter._subscribe_websocket(websocket)
+
+    request = next(
+        frame for frame in websocket.sent if frame[1] == "hermes-buzz-terminal-control"
+    )
+    assert request[2] == {
+        "kinds": [24200],
+        "#p": [SELF_PUBKEY],
+        "#agent": [SELF_PUBKEY],
+        "#frame": ["control"],
+        "since": request[2]["since"],
+    }
+    assert subscriptions["hermes-buzz-terminal-control"] is None
+
+
+@pytest.mark.asyncio
 async def test_websocket_auth_raises_on_rejection():
     adapter = _make_adapter()
 

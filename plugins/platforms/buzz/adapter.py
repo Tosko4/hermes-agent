@@ -31,6 +31,10 @@ Configuration in config.yaml::
             channel_skill_bindings:    # auto-load one or more skills per Buzz channel/forum
               - id: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
                 skills: [research, summarize]
+            terminal_enabled: false     # encrypted mobile PTY, disabled by default
+            terminal_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
+            terminal_allowed_users: [] # exact owner pubkeys; required when enabled
+            terminal_cwd: ""            # defaults to the Hermes user's home
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -135,6 +139,8 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+_WS_TERMINAL_KIND = 24200
+_WS_TERMINAL_SUB_ID = "hermes-buzz-terminal-control"
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -163,6 +169,30 @@ def _load_nostr_auth():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+
+def _load_terminal_broker():
+    """Import the sibling terminal broker under both plugin loader shapes."""
+    try:
+        from .terminal_broker import TerminalBroker
+
+        return TerminalBroker
+    except ImportError:
+        import importlib.util
+        import sys
+
+        path = Path(__file__).with_name("terminal_broker.py")
+        module_name = "plugin_adapter_buzz_terminal_broker"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        return module.TerminalBroker
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +547,34 @@ class BuzzAdapter(BasePlatformAdapter):
             "on",
         )
 
+        _terminal_cfg = os.getenv("BUZZ_TERMINAL_ENABLED")
+        if _terminal_cfg is None:
+            _terminal_cfg = extra.get("terminal_enabled", False)
+        self.terminal_enabled = str(_terminal_cfg).strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
+        self.terminal_channel = (
+            os.getenv("BUZZ_TERMINAL_CHANNEL")
+            or str(extra.get("terminal_channel", "") or "")
+            or self.home_channel
+        ).strip()
+        self.terminal_cwd = (
+            os.getenv("BUZZ_TERMINAL_CWD") or str(extra.get("terminal_cwd", "") or "")
+        ).strip()
+        raw_terminal_allowed = os.getenv("BUZZ_TERMINAL_ALLOWED_USERS") or extra.get(
+            "terminal_allowed_users", []
+        )
+        if isinstance(raw_terminal_allowed, str):
+            raw_terminal_allowed = raw_terminal_allowed.split(",")
+        self._terminal_allowed_pubkeys: set[str] = {
+            normalized
+            for entry in raw_terminal_allowed
+            if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
+        }
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -573,6 +631,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        self._terminal_broker = None
 
     @property
     def name(self) -> str:
@@ -602,6 +661,31 @@ class BuzzAdapter(BasePlatformAdapter):
             relay_url=self.relay_url,
             private_key=self._private_key,
         )
+
+    async def _decrypt_terminal_event(self, event: dict) -> dict:
+        code, out, err = await self._run_cli(
+            ["agents", "observer-decrypt", "--event", "-"],
+            input_text=json.dumps(event, separators=(",", ":")),
+        )
+        if code != 0:
+            raise ValueError(_cli_error_message(err, code))
+        decoded = json.loads(out or "{}")
+        if not isinstance(decoded, dict):
+            raise ValueError("buzz observer-decrypt returned a non-object")
+        return decoded
+
+    async def _publish_terminal_telemetry(self, payload: dict) -> bool:
+        code, _out, err = await self._run_cli(
+            ["agents", "observer-telemetry", "--payload", "-"],
+            input_text=json.dumps(payload, separators=(",", ":")),
+        )
+        if code != 0:
+            logger.warning(
+                "Buzz: terminal telemetry publish failed — %s",
+                _cli_error_message(err, code),
+            )
+            return False
+        return True
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -695,6 +779,28 @@ class BuzzAdapter(BasePlatformAdapter):
         for ch in listed:
             if ch.get("channel_id"):
                 self._channel_meta[str(ch["channel_id"])] = ch
+        if self.terminal_enabled:
+            if self.transport == "poll":
+                self._set_fatal_error(
+                    "config_invalid",
+                    "Buzz terminal requires websocket or auto transport",
+                    retryable=False,
+                )
+                return False
+            if not self.terminal_channel or not self._terminal_allowed_pubkeys:
+                self._set_fatal_error(
+                    "config_invalid",
+                    "Buzz terminal requires terminal_channel and terminal_allowed_users",
+                    retryable=False,
+                )
+                return False
+            if self.terminal_channel not in self._channel_names:
+                self._set_fatal_error(
+                    "config_invalid",
+                    "Buzz terminal_channel must be a joined channel",
+                    retryable=False,
+                )
+                return False
         watch = self.channels or list(self._channel_names)
         if not watch:
             logger.error(
@@ -711,6 +817,25 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._seed_channel(channel_id, chat_type="group")
         await self._discover_dms(seed=True)
 
+        if self.terminal_enabled:
+            try:
+                broker_type = _load_terminal_broker()
+                self._terminal_broker = broker_type(
+                    agent_pubkey=self._self_pubkey,
+                    allowed_users=self._terminal_allowed_pubkeys,
+                    channel_id=self.terminal_channel,
+                    cwd=self.terminal_cwd,
+                    decrypt_event=self._decrypt_terminal_event,
+                    publish_telemetry=self._publish_terminal_telemetry,
+                )
+                await self._terminal_broker.start()
+            except Exception as exc:
+                self._set_fatal_error(
+                    "terminal_start_failed", str(exc), retryable=False
+                )
+                await self.disconnect()
+                return False
+
         # Inbound transport: prefer the NIP-42-authenticated WebSocket
         # subscription (push, near-zero latency); fall back to CLI polling
         # when the WS can't be established (transport="auto") or when the
@@ -719,7 +844,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if self.transport in ("auto", "websocket"):
             if await self._start_websocket():
                 transport_used = "websocket"
-            elif self.transport == "websocket":
+            elif self.transport == "websocket" or self.terminal_enabled:
                 self._set_fatal_error(
                     "ws_auth_failed",
                     "Buzz WebSocket transport did not authenticate (transport=websocket)",
@@ -787,6 +912,9 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._ws_task = None
+        if self._terminal_broker is not None:
+            await self._terminal_broker.stop()
+            self._terminal_broker = None
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -1363,6 +1491,20 @@ class BuzzAdapter(BasePlatformAdapter):
             ]
             await websocket.send(json.dumps(request, separators=(",", ":")))
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
+        if self._terminal_broker is not None and self._self_pubkey:
+            request = [
+                "REQ",
+                _WS_TERMINAL_SUB_ID,
+                {
+                    "kinds": [_WS_TERMINAL_KIND],
+                    "#p": [self._self_pubkey],
+                    "#agent": [self._self_pubkey],
+                    "#frame": ["control"],
+                    "since": max(int(time.time()) - 1, 0),
+                },
+            ]
+            await websocket.send(json.dumps(request, separators=(",", ":")))
+            subscriptions[_WS_TERMINAL_SUB_ID] = None
         return subscriptions
 
     async def _handle_membership_event(
@@ -1431,6 +1573,10 @@ class BuzzAdapter(BasePlatformAdapter):
                                         websocket, subscriptions, event
                                     )
                                     continue
+                                if subscription_id == _WS_TERMINAL_SUB_ID:
+                                    if self._terminal_broker is not None:
+                                        await self._terminal_broker.handle_event(event)
+                                    continue
                                 channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
                                 if channel_id and state is not None:
@@ -1446,6 +1592,10 @@ class BuzzAdapter(BasePlatformAdapter):
                                     else "subscription closed"
                                 )
                                 channel_id = subscriptions.pop(subscription_id, None)
+                                if subscription_id == _WS_TERMINAL_SUB_ID:
+                                    raise ConnectionError(
+                                        f"terminal control subscription closed: {detail}"
+                                    )
                                 if channel_id:
                                     # One stale or revoked channel must not tear
                                     # down every healthy subscription. Drop it
@@ -2260,6 +2410,8 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         "cli_path": "BUZZ_CLI_PATH",
         "home_channel": "BUZZ_HOME_CHANNEL",
         "transport": "BUZZ_TRANSPORT",
+        "terminal_channel": "BUZZ_TERMINAL_CHANNEL",
+        "terminal_cwd": "BUZZ_TERMINAL_CWD",
     }
     for src, env in _str_keys.items():
         val = extra.get(src)
@@ -2278,10 +2430,17 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(a) for a in allowed)
         os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
+    terminal_allowed = extra.get("terminal_allowed_users")
+    if terminal_allowed is not None and not os.getenv("BUZZ_TERMINAL_ALLOWED_USERS"):
+        if isinstance(terminal_allowed, (list, tuple)):
+            terminal_allowed = ",".join(str(a) for a in terminal_allowed)
+        os.environ["BUZZ_TERMINAL_ALLOWED_USERS"] = str(terminal_allowed)
     if "allow_all_users" in extra and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    if "terminal_enabled" in extra and not os.getenv("BUZZ_TERMINAL_ENABLED"):
+        os.environ["BUZZ_TERMINAL_ENABLED"] = str(extra["terminal_enabled"]).lower()
     return None
 
 
@@ -2311,6 +2470,25 @@ def _env_enablement() -> Optional[dict]:
     cli_path = os.getenv("BUZZ_CLI_PATH", "").strip()
     if cli_path:
         seed["cli_path"] = cli_path
+    terminal_enabled = os.getenv("BUZZ_TERMINAL_ENABLED", "").strip()
+    if terminal_enabled:
+        seed["terminal_enabled"] = terminal_enabled.lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
+    terminal_channel = os.getenv("BUZZ_TERMINAL_CHANNEL", "").strip()
+    if terminal_channel:
+        seed["terminal_channel"] = terminal_channel
+    terminal_cwd = os.getenv("BUZZ_TERMINAL_CWD", "").strip()
+    if terminal_cwd:
+        seed["terminal_cwd"] = terminal_cwd
+    terminal_allowed = os.getenv("BUZZ_TERMINAL_ALLOWED_USERS", "").strip()
+    if terminal_allowed:
+        seed["terminal_allowed_users"] = [
+            entry.strip() for entry in terminal_allowed.split(",") if entry.strip()
+        ]
     # Home channel for deliver=buzz cron jobs; defaults to the first watched
     # channel so env-only setups get a sensible target without extra config.
     home = (
