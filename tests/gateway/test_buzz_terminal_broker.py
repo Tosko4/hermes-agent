@@ -116,6 +116,21 @@ async def test_safe_command_runs_in_persistent_shell_and_reports_cwd():
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_telemetry_always_has_a_canonical_request_id():
+    harness = Harness()
+    await harness.start()
+    try:
+        await harness.control("open")
+        session_id = (await harness.wait_for("opened"))["session_id"]
+        await harness.broker._close_session(session_id, reason="test_reaper")
+        closed = await harness.wait_for("closed")
+
+        assert str(uuid.UUID(closed["request_id"])) == closed["request_id"]
+    finally:
+        await harness.stop()
+
+
+@pytest.mark.asyncio
 async def test_blocked_command_never_reaches_pty(monkeypatch):
     harness = Harness(
         guard=lambda _command, _key: {

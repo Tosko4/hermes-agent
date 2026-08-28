@@ -728,12 +728,20 @@ class TerminalBroker:
         session_id: str,
         data: dict,
     ) -> None:
+        try:
+            telemetry_request_id = _canonical_uuid(request_id, "request_id")
+        except (TypeError, ValueError, AttributeError):
+            # Output emitted before a command and lifecycle-driven closes have
+            # no client request to correlate. Give every encrypted frame its
+            # own canonical id so strict mobile consumers can still validate
+            # and deduplicate it without weakening the wire contract.
+            telemetry_request_id = str(uuid.uuid4())
         payload = {
             "kind": PROTOCOL_KIND,
             "version": PROTOCOL_VERSION,
             "direction": "telemetry",
             "action": action,
-            "request_id": request_id,
+            "request_id": telemetry_request_id,
             "sent_at": int(time.time()),
             "channel_id": self.channel_id,
             "session_id": session_id,
