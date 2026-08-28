@@ -119,12 +119,16 @@ async def test_creates_titled_forum_root_with_exact_mentions_and_origin(
         "-",
         "--kind",
         "45001",
+        "--title",
+        "Onderzoek push delivery",
         "--mention",
         AGENT,
     ]
     assert kwargs["private_key"] == "private-test-key"
     assert kwargs["relay_url"] == "https://buzz.example"
-    assert kwargs["input_text"].startswith("# Onderzoek push delivery\n\n")
+    assert kwargs["input_text"].startswith(
+        "Verifieer de volledige Firebase-keten met primaire bronnen.\n\n"
+    )
     assert (
         f"Bron: buzz://message?channel={HOME}&id={SOURCE_EVENT}" in kwargs["input_text"]
     )
@@ -237,13 +241,13 @@ async def test_requires_origin_event_and_bounded_fields(configured, monkeypatch)
     too_long = await buzz_tools.buzz_orchestrate(
         {
             "route": "research",
-            "title": "x" * 121,
+            "title": "x" * 81,
             "task": "body",
             "agents": ["Cosmo"],
         },
         state=FakeState(),
     )
-    assert "120" in too_long
+    assert "80" in too_long
 
     clear_session_vars([])
     tokens = set_session_vars(

@@ -22,7 +22,7 @@ _CHANNEL_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-_MAX_TITLE_CHARS = 120
+_MAX_TITLE_CHARS = 80
 _MAX_TASK_CHARS = 48_000
 _MAX_AGENTS = 3
 _PENDING_TTL_SECONDS = 120
@@ -273,9 +273,9 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
     names = [name for name, _ in agents]
     origin_link = f"buzz://message?channel={source_channel}&id={source_event}"
     mentions = " ".join(f"@{name}" for name in names)
+    body = task if route_kind == "forum" else f"# {title}\n\n{task}"
     content = (
-        f"# {title}\n\n{task}\n\n"
-        f"---\nVanuit #nabu georkestreerd door Nabu.\n"
+        f"{body}\n\n---\nVanuit #nabu georkestreerd door Nabu.\n"
         f"Opdracht voor: {mentions}\n"
         f"Bron: {origin_link}"
     )
@@ -306,6 +306,8 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
         "--kind",
         "45001" if route_kind == "forum" else "9",
     ]
+    if route_kind == "forum":
+        command.extend(("--title", title))
     for _, pubkey in agents:
         command.extend(("--mention", pubkey))
 
@@ -365,7 +367,7 @@ BUZZ_ORCHESTRATE_SCHEMA = {
             },
             "title": {
                 "type": "string",
-                "description": "Short specific title for the new work thread (max 120 characters).",
+                "description": "Short specific title for the new work thread (max 80 characters).",
             },
             "task": {
                 "type": "string",
