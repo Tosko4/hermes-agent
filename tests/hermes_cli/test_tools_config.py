@@ -134,6 +134,23 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
     assert "discord_admin" not in enabled
 
 
+def test_buzz_plugin_toolset_is_restricted_to_buzz_sessions(monkeypatch):
+    """A newly discovered Buzz plugin must not leak its host-signing tool to
+    CLI or unrelated messaging surfaces, while explicit Buzz enablement works.
+    """
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_plugin_toolset_keys", lambda: {"buzz"})
+
+    assert "buzz" not in _get_platform_tools({}, "cli")
+    assert "buzz" not in _get_platform_tools(
+        {"platform_toolsets": {"telegram": ["buzz"]}}, "telegram"
+    )
+    assert "buzz" in _get_platform_tools(
+        {"platform_toolsets": {"buzz": ["buzz"]}}, "buzz"
+    )
+
+
 
 
 

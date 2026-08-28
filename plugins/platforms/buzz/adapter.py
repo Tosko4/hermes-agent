@@ -31,6 +31,11 @@ Configuration in config.yaml::
             channel_skill_bindings:    # auto-load one or more skills per Buzz channel/forum
               - id: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
                 skills: [research, summarize]
+            orchestration:             # owner-only Nabu work routing
+              enabled: false
+              home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
+              allowed_users: []        # exact owner pubkeys; required when enabled
+              routes: {}               # configured route + specialist allow-lists
             terminal_enabled: false     # encrypted mobile PTY, disabled by default
             terminal_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             terminal_allowed_users: [] # exact owner pubkeys; required when enabled
@@ -2689,6 +2694,9 @@ def register(ctx):
             "You are collaborating in a Buzz workspace (Block's Nostr-based "
             "human+agent platform). Markdown IS supported. Users address you "
             "by @-mentioning your name or npub in channels; direct messages "
-            "reach you without a mention. Keep responses conversational."
+            "reach you without a mention. In an owner-configured coordinator "
+            "channel, use buzz_orchestrate to create and assign a real Buzz "
+            "work thread instead of simulating delegation in prose. Keep "
+            "responses conversational."
         ),
     )

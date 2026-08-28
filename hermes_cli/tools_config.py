@@ -213,6 +213,7 @@ def _homeassistant_credentials_present() -> bool:
 # server admin, Slack workspace admin, etc.).  Keeps every other platform's
 # checklist from filling up with irrelevant toggles.
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
+    "buzz": {"buzz"},
     "discord": {"discord"},
     "discord_admin": {"discord"},
 }
@@ -2603,6 +2604,8 @@ def _get_platform_tools(
         known_map = config.get("known_plugin_toolsets", {}) or {}
         known_for_platform = set(known_map.get(platform, []) or [])
         for pts in plugin_ts_keys:
+            if not _toolset_allowed_for_platform(pts, platform):
+                continue
             if pts in toolset_names:
                 # Explicitly listed in config — enabled
                 enabled_toolsets.add(pts)
