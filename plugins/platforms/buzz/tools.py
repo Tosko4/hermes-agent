@@ -120,9 +120,9 @@ def _route(config: Mapping[str, Any], route_name: str) -> tuple[dict | None, str
     return dict(route), ""
 
 
-def _agents(
-    orchestration: Mapping[str, Any], route: Mapping[str, Any], requested: Any
-) -> tuple[list[tuple[str, str]], str]:
+def _configured_agents(
+    orchestration: Mapping[str, Any], route: Mapping[str, Any]
+) -> tuple[dict[str, tuple[str, str]], str]:
     global_agents = orchestration.get("agents")
     route_agents = route.get("agents")
     if isinstance(route_agents, Mapping):
@@ -136,34 +136,86 @@ def _agents(
     else:
         configured = None
     if not isinstance(configured, Mapping):
-        return [], "This route has no specialist allow-list."
-    if not isinstance(requested, list) or not requested:
-        return [], "Choose at least one specialist."
-    if len(requested) > _MAX_AGENTS:
-        return [], f"Choose at most {_MAX_AGENTS} specialists."
+        return {}, "This route has no specialist allow-list."
 
     by_name = {
         str(name).strip().lower(): (str(name).strip(), value)
         for name, value in configured.items()
     }
-    resolved: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for raw_name in requested:
-        key = str(raw_name or "").strip().lower()
-        entry = by_name.get(key)
-        if entry is None:
-            choices = ", ".join(sorted(name for name, _ in by_name.values())) or "none"
-            return (
-                [],
-                f"Specialist '{raw_name}' is not allowed for this route. Allowed: {choices}.",
-            )
-        display_name, raw_pubkey = entry
+    resolved: dict[str, tuple[str, str]] = {}
+    for key, (display_name, raw_pubkey) in by_name.items():
         pubkey = _normalize_pubkey(raw_pubkey)
         if not pubkey:
-            return [], f"Specialist '{display_name}' has an invalid configured pubkey."
-        if pubkey not in seen:
-            seen.add(pubkey)
-            resolved.append((display_name, pubkey))
+            return {}, f"Specialist '{display_name}' has an invalid configured pubkey."
+        resolved[key] = (display_name, pubkey)
+    return resolved, ""
+
+
+def _assignments(
+    orchestration: Mapping[str, Any], route: Mapping[str, Any], args: Mapping[str, Any]
+) -> tuple[list[tuple[str, str, str, str]], str]:
+    configured, error = _configured_agents(orchestration, route)
+    if error:
+        return [], error
+
+    legacy_agents = args.get("agents")
+    requested_agent = args.get("agent")
+    requested_assignments = args.get("assignments")
+    selected_inputs = sum(
+        value is not None for value in (legacy_agents, requested_agent, requested_assignments)
+    )
+    if selected_inputs > 1:
+        return [], "Choose one assignment form: agent or structured assignments."
+
+    raw_assignments: list[tuple[Any, str, str]] = []
+    if legacy_agents is not None:
+        if not isinstance(legacy_agents, list) or not legacy_agents:
+            return [], "Choose a specialist or use the route primary."
+        if len(legacy_agents) > 1:
+            return [], (
+                "Multi-agent work requires a distinct responsibility and acceptance "
+                "gate for every specialist; use structured assignments."
+            )
+        raw_assignments.append((legacy_agents[0], "", ""))
+    elif requested_agent is not None:
+        raw_assignments.append((requested_agent, "", ""))
+    elif requested_assignments is not None:
+        if not isinstance(requested_assignments, list) or not requested_assignments:
+            return [], "Structured assignments must contain at least one specialist."
+        if len(requested_assignments) > _MAX_AGENTS:
+            return [], f"Choose at most {_MAX_AGENTS} specialists."
+        for item in requested_assignments:
+            if not isinstance(item, Mapping):
+                return [], "Every structured assignment must be an object."
+            responsibility = str(item.get("responsibility") or "").strip()
+            acceptance = str(item.get("acceptance") or "").strip()
+            if not responsibility or not acceptance:
+                return [], (
+                    "Every structured assignment requires a non-empty responsibility "
+                    "and acceptance gate."
+                )
+            raw_assignments.append((item.get("agent"), responsibility, acceptance))
+    else:
+        primary = route.get("primary_agent") or orchestration.get("primary_agent")
+        if not str(primary or "").strip():
+            return [], "This route has no configured primary specialist."
+        raw_assignments.append((primary, "", ""))
+
+    resolved: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+    for raw_name, responsibility, acceptance in raw_assignments:
+        key = str(raw_name or "").strip().lower()
+        entry = configured.get(key)
+        if entry is None:
+            choices = ", ".join(sorted(name for name, _ in configured.values())) or "none"
+            return [], (
+                f"Specialist '{raw_name}' is not allowed for this route. Allowed: {choices}."
+            )
+        display_name, pubkey = entry
+        if pubkey in seen:
+            return [], f"Specialist '{display_name}' is assigned more than once."
+        seen.add(pubkey)
+        resolved.append((display_name, pubkey, responsibility, acceptance))
     return resolved, ""
 
 
@@ -188,7 +240,7 @@ def _state_key(
     route_name: str,
     title: str,
     task: str,
-    agents: list[tuple[str, str]],
+    assignments: list[tuple[str, str, str, str]],
 ) -> str:
     canonical = json.dumps(
         {
@@ -196,7 +248,14 @@ def _state_key(
             "route": route_name,
             "title": title,
             "task": task,
-            "agents": [pubkey for _, pubkey in agents],
+            "assignments": [
+                {
+                    "pubkey": pubkey,
+                    "responsibility": responsibility,
+                    "acceptance": acceptance,
+                }
+                for _, pubkey, responsibility, acceptance in assignments
+            ],
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -207,7 +266,7 @@ def _state_key(
 
 
 def _success_text(record: Mapping[str, Any]) -> str:
-    agents = ", ".join(f"@{name}" for name in record.get("agents") or [])
+    agents = ", ".join(str(name) for name in record.get("agents") or [])
     return (
         f"Werkplek aangemaakt in #{record.get('route_label')}: {record.get('title')}\n"
         f"Link: {record.get('link')}\n"
@@ -231,7 +290,7 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
     title, task, error = _validate_text(args)
     if error:
         return f"Error: {error}"
-    agents, error = _agents(orchestration, route, args.get("agents"))
+    assignments, error = _assignments(orchestration, route, args)
     if error:
         return f"Error: {error}"
 
@@ -248,7 +307,7 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
     if not _CHANNEL_ID.fullmatch(source_channel):
         return "Error: the originating Buzz channel is invalid; no work thread was created."
 
-    key = _state_key(source_event, route_name, title, task, agents)
+    key = _state_key(source_event, route_name, title, task, assignments)
     now = int(time.time())
     if state is not None:
         with _STATE_LOCK:
@@ -270,13 +329,30 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
             state.set(key, {"status": "pending", "updated_at": now})
 
     route_label = str(route.get("label") or route_name).strip() or route_name
-    names = [name for name, _ in agents]
+    names = [name for name, _, _, _ in assignments]
     origin_link = f"buzz://message?channel={source_channel}&id={source_event}"
-    mentions = " ".join(f"@{name}" for name in names)
     body = task if route_kind == "forum" else f"# {title}\n\n{task}"
+    if len(assignments) == 1:
+        name, _, responsibility, acceptance = assignments[0]
+        assignment_text = f"Primaire uitvoerder: {name}"
+        if responsibility:
+            assignment_text += f"\nVerantwoordelijkheid: {responsibility}"
+        if acceptance:
+            assignment_text += f"\nAcceptatie: {acceptance}"
+    else:
+        rows = ["Taakverdeling:"]
+        for name, _, responsibility, acceptance in assignments:
+            rows.extend(
+                (
+                    f"- {name}",
+                    f"  Verantwoordelijkheid: {responsibility}",
+                    f"  Acceptatie: {acceptance}",
+                )
+            )
+        assignment_text = "\n".join(rows)
     content = (
-        f"{body}\n\n---\nVanuit #nabu georkestreerd door Nabu.\n"
-        f"Opdracht voor: {mentions}\n"
+        f"{body}\n\n---\nVanuit het coördinatorkanaal georkestreerd.\n"
+        f"{assignment_text}\n"
         f"Bron: {origin_link}"
     )
 
@@ -295,6 +371,14 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
         if state is not None:
             state.set(key, {"status": "failed", "updated_at": int(time.time())})
         return "Error: Buzz relay, CLI, or signing identity is not configured for orchestration."
+    try:
+        from .nostr_auth import public_key_hex
+
+        coordinator_pubkey = public_key_hex(private_key)
+    except (TypeError, ValueError):
+        if state is not None:
+            state.set(key, {"status": "failed", "updated_at": int(time.time())})
+        return "Error: the configured Buzz orchestration signing identity is invalid."
 
     command = [
         "messages",
@@ -308,7 +392,8 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
     ]
     if route_kind == "forum":
         command.extend(("--title", title))
-    for _, pubkey in agents:
+    command.append("--callback-to-sender")
+    for _, pubkey, _, _ in assignments:
         command.extend(("--mention", pubkey))
 
     code, stdout, stderr = await _exec_buzz(
@@ -328,12 +413,30 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
         result = json.loads(stdout or "{}")
         event_id = str(result.get("event_id") or "").strip().lower()
         accepted = result.get("accepted", True)
+        emitted_mentions = [
+            _normalize_pubkey(value) for value in result.get("mention_pubkeys") or []
+        ]
+        callback_pubkey = _normalize_pubkey(result.get("callback_pubkey"))
     except (AttributeError, ValueError):
-        event_id, accepted = "", False
-    if not _HEX_PUBKEY.fullmatch(event_id) or accepted is False:
+        event_id, accepted, emitted_mentions, callback_pubkey = "", False, [], ""
+    expected_mentions = [pubkey for _, pubkey, _, _ in assignments]
+    envelope_matches = (
+        len(emitted_mentions) == len(expected_mentions)
+        and set(emitted_mentions) == set(expected_mentions)
+        and callback_pubkey == coordinator_pubkey
+        and coordinator_pubkey not in expected_mentions
+    )
+    if (
+        not _HEX_PUBKEY.fullmatch(event_id)
+        or accepted is False
+        or not envelope_matches
+    ):
         if state is not None:
             state.set(key, {"status": "indeterminate", "updated_at": int(time.time())})
-        return "Error: Buzz returned no verifiable event ID; reconcile the target channel before retrying."
+        return (
+            "Error: Buzz returned no verifiable signed assignment/callback envelope; "
+            "reconcile the target channel before retrying."
+        )
 
     record = {
         "status": "complete",
@@ -373,15 +476,28 @@ BUZZ_ORCHESTRATE_SCHEMA = {
                 "type": "string",
                 "description": "Self-contained assignment with outcome, constraints, and acceptance evidence.",
             },
-            "agents": {
+            "agent": {
+                "type": "string",
+                "description": "Optional single specialist; omit to use the route's host-owned primary.",
+            },
+            "assignments": {
                 "type": "array",
-                "items": {"type": "string"},
                 "minItems": 1,
                 "maxItems": _MAX_AGENTS,
-                "description": "One or more configured specialists, e.g. Cosmo, Neo, Loki, Looi, or Dash.",
+                "description": "Structured multi-specialist work; every entry owns a distinct responsibility and acceptance gate.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string"},
+                        "responsibility": {"type": "string", "minLength": 1},
+                        "acceptance": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["agent", "responsibility", "acceptance"],
+                    "additionalProperties": False,
+                },
             },
         },
-        "required": ["route", "title", "task", "agents"],
+        "required": ["route", "title", "task"],
         "additionalProperties": False,
     },
 }
