@@ -385,6 +385,36 @@ class TestMentionGating:
         )
         assert adapter._agent_mention_policy(duplicate) is True
 
+    def test_agent_specific_thread_policy_overrides_default(self, adapter):
+        event = _event("a" * 64)
+        event["tags"].extend(
+            [
+                ["agent_mentions", "required"],
+                ["agent_mentions", SELF_PUBKEY, "optional"],
+                ["agent_mentions", "b" * 64, "required"],
+            ]
+        )
+        assert adapter._agent_mention_policy(event, SELF_PUBKEY) is False
+        assert adapter._agent_mention_policy(event, "b" * 64) is True
+
+    @pytest.mark.asyncio
+    async def test_agent_specific_channel_policy_overrides_default(self, adapter):
+        adapter._self_pubkey = SELF_PUBKEY
+        cli = _ScriptedCli()
+        cli.script(
+            "channels",
+            "get",
+            {
+                "channel_id": CHANNEL,
+                "name": "research",
+                "agent_mentions": "required",
+                "agent_mention_overrides": {SELF_PUBKEY: "optional"},
+            },
+        )
+        adapter._run_cli = cli
+
+        assert await adapter._effective_mention_required(CHANNEL, _event("e1")) is False
+
     @pytest.mark.asyncio
     async def test_latest_thread_edit_updates_policy_without_loading_history(
         self, adapter
@@ -1204,7 +1234,7 @@ class TestBuzzAdapterSend:
         assert args[args.index("--kind") + 1] == "45003"
 
     @pytest.mark.asyncio
-    async def test_dm_style_send_keeps_reply_anchor_without_thread(self):
+    async def test_dm_style_send_stays_top_level_without_explicit_thread(self):
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {
             "chat_type": "dm",
@@ -1223,7 +1253,7 @@ class TestBuzzAdapterSend:
         )
 
         args, _stdin = cli.calls[0]
-        assert args[args.index("--reply-to") + 1] == "dm-message"
+        assert "--reply-to" not in args
 
     @pytest.mark.asyncio
     async def test_edit_streams_content_via_stdin(self):
