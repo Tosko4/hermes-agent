@@ -1,7 +1,7 @@
 ---
 name: nabu-buzz-orchestration
 description: "Route #nabu work to forums and specialist agents."
-version: 1.0.0
+version: 1.1.0
 author: Maikel (@Tosko4) + Hermes Agent
 license: MIT
 platforms: [linux]
@@ -37,8 +37,11 @@ project topic, or a simple answer that needs no separate workplace.
 
 ## How to Run
 
-Interpret the request, choose one route and one to three specialists, then call
-`buzz_orchestrate` with `route`, `title`, `task`, and `agents`.
+Interpret the request, choose one route, and normally let its host-owned primary
+specialist handle it. Call `buzz_orchestrate` with `route`, `title`, and `task`.
+Use `agent` only to override that primary deliberately. For genuinely parallel
+work, use `assignments`; every entry must carry its own `agent`,
+`responsibility`, and `acceptance` gate.
 
 After success, answer in `#nabu` with the returned link, destination,
 assignees, and the next expected evidence.
@@ -70,17 +73,22 @@ Route by subject, not by requested method:
 1. Extract the requested outcome, constraints, and required proof.
 2. Keep one coherent outcome in one root. Split only independent outcomes.
 3. Choose the narrowest configured route for the subject.
-4. Choose the smallest sufficient specialist set; use at most three.
-5. Write a short, specific title without a conversational preamble.
-6. Write a self-contained task that includes acceptance evidence and safety
+4. Use the route's primary specialist by default. Override it only when another
+   specialist clearly owns the work.
+5. If several specialists are genuinely required, give each a distinct,
+   non-overlapping responsibility and acceptance gate; use at most three.
+6. Write a short, specific title without a conversational preamble.
+7. Write a self-contained task that includes acceptance evidence and safety
    gates relevant to the work.
-7. Call `buzz_orchestrate` exactly once for that request.
-8. Confirm the returned destination, specialist names, and Buzz deep link.
-9. Report the handoff in `#nabu`; let execution continue in the new thread.
+8. Call `buzz_orchestrate` exactly once for that request.
+9. Confirm the returned destination, plain specialist names, and Buzz deep link.
+10. Report the handoff in `#nabu` without visible `@Specialist` mentions; let
+    execution continue in the new thread.
 
-The tool publishes a signed forum or stream root, adds real Nostr `p` tags,
-and links back to the originating `#nabu` event. Those event tags, not visible
-`@Name` text alone, are the semantic assignment signal.
+The tool publishes a signed forum or stream root, adds real Nostr `p` tags for
+assignees, adds generic callback metadata for the signing coordinator, and
+links back to the originating `#nabu` event. Those event tags, never visible
+`@Name` text, are the semantic assignment and callback signals.
 
 ## Pitfalls
 
@@ -92,6 +100,8 @@ and links back to the originating `#nabu` event. Those event tags, not visible
 - Do not duplicate the specialist's assigned work in the coordinator chat.
 - Do not route by whichever agent name the user happened to mention when the
   subject clearly belongs elsewhere.
+- Never use an undifferentiated multi-agent list. It makes every agent treat the
+  whole root as its own job and creates duplicate or conflicting execution.
 
 ## Verification
 

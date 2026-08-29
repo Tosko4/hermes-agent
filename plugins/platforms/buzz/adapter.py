@@ -130,6 +130,8 @@ _SEEN_CAP = 500
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
+_CHANNEL_POLICY_TTL_SECONDS = 5.0
+_THREAD_POLICY_TTL_SECONDS = 2.0
 
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
@@ -634,6 +636,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
+        self._channel_policy_checked_at: Dict[str, float] = {}
+        # root event id -> (explicit policy or None for inherit, checked_at)
+        self._thread_policy_cache: Dict[str, Tuple[Optional[bool], float]] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
         self._terminal_broker = None
@@ -982,6 +987,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # manufacture a thread for every prompt. DMs retain their ordinary
         # reply anchor because they are conversations rather than channels.
         thread_id = (metadata or {}).get("thread_id")
+        if (metadata or {}).get("notify") is True and not (metadata or {}).get(
+            "_interim_send"
+        ):
+            args.append("--final-response")
         chat_type = str(
             self._channel_state.get(str(chat_id), {}).get("chat_type") or ""
         )
@@ -1736,7 +1745,13 @@ class BuzzAdapter(BasePlatformAdapter):
                 continue
             self._channel_meta[ch_id] = ch
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
-            if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
+            if ch_id in self._channel_state:
+                continue
+            # With no explicit BUZZ_CHANNELS list the adapter owns all joined
+            # conversations, including real channels/forums created after
+            # startup. With an explicit list, retain the DM fallback without
+            # silently widening the configured channel scope.
+            if self.channels and not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
@@ -1805,25 +1820,22 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
+        # In shared channels, the relay-authored channel metadata and optional
+        # thread-root override decide whether an @mention is required. Legacy
+        # config remains the fallback for older relays. DMs always dispatch.
         if not is_dm:
-            is_home_channel = (
-                bool(self.home_channel) and channel_id == self.home_channel
-            )
             is_bare_slash = content.lstrip().startswith("/")
-            explicitly_targeted_elsewhere = (
-                is_home_channel and self._has_foreign_only_p_targets(event)
+            mention_required = await self._effective_mention_required(
+                channel_id, event
             )
+            semantically_targeted = self._has_self_p_target(event)
+            explicitly_targeted_elsewhere = self._has_foreign_only_p_targets(event)
             implicitly_addressed = (
-                is_home_channel and not explicitly_targeted_elsewhere
-            ) or (self.accept_bare_slash_commands and is_bare_slash)
-            if (
-                self.require_mention
-                and not implicitly_addressed
-                and not self._is_mentioned(content)
-            ):
+                not mention_required and not explicitly_targeted_elsewhere
+            ) or semantically_targeted or (
+                self.accept_bare_slash_commands and is_bare_slash
+            )
+            if not implicitly_addressed and not self._is_mentioned(content):
                 if self.observe_unaddressed_messages:
                     await self._observe_unaddressed_message(
                         channel_id=channel_id,
@@ -1978,12 +1990,6 @@ class BuzzAdapter(BasePlatformAdapter):
         reply markers. The outer root always wins, so every message in an
         explicitly created stream thread or forum topic continues one session.
         """
-        if int(event.get("kind") or 0) == _FORUM_POST_KIND:
-            event_id = str(event.get("id") or "")
-            if len(event_id) == 64 and all(
-                c in "0123456789abcdef" for c in event_id.lower()
-            ):
-                return event_id
         tags = event.get("tags")
         if isinstance(tags, list):
             for tag in tags:
@@ -1995,6 +2001,22 @@ class BuzzAdapter(BasePlatformAdapter):
                     and tag[1]
                 ):
                     return str(tag[1])
+        is_titled_root = isinstance(tags, list) and any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "subject"
+            for tag in tags
+        )
+        if (
+            int(event.get("kind") or 0) == _FORUM_POST_KIND
+            or (int(event.get("kind") or 0) != 40003 and is_titled_root)
+        ):
+            event_id = str(event.get("id") or "")
+            if len(event_id) == 64 and all(
+                c in "0123456789abcdef" for c in event_id.lower()
+            ):
+                return event_id
+        if isinstance(tags, list):
             for tag in tags:
                 if (
                     isinstance(tag, (list, tuple))
@@ -2004,6 +2026,118 @@ class BuzzAdapter(BasePlatformAdapter):
                 ):
                     return str(tag[1])
         return None
+
+    @staticmethod
+    def _agent_mention_policy(event: dict) -> Optional[bool]:
+        """Return an explicit required/optional policy, or None to inherit."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        policy: Optional[bool] = None
+        found = False
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or not tag:
+                continue
+            if tag[0] != "agent_mentions":
+                continue
+            # Thread roots are ordinary message events rather than privileged
+            # channel metadata. Treat malformed or duplicate policy tags as
+            # mention-required instead of accidentally inheriting an optional
+            # channel policy.
+            if found or len(tag) != 2 or tag[1] not in {"required", "optional"}:
+                return True
+            found = True
+            policy = tag[1] == "required"
+        return policy
+
+    async def _refresh_channel_policy(self, channel_id: str) -> Optional[bool]:
+        now = time.monotonic()
+        checked_at = self._channel_policy_checked_at.get(channel_id, 0.0)
+        meta = self._channel_meta.get(channel_id)
+        if now - checked_at >= _CHANNEL_POLICY_TTL_SECONDS:
+            code, out, _err = await self._run_cli(
+                ["channels", "get", "--channel", channel_id]
+            )
+            if code == 0:
+                try:
+                    loaded = json.loads(out or "null")
+                except ValueError:
+                    loaded = None
+                if isinstance(loaded, dict):
+                    meta = loaded
+                    self._channel_meta[channel_id] = loaded
+                    if loaded.get("name"):
+                        self._channel_names[channel_id] = str(loaded["name"])
+            self._channel_policy_checked_at[channel_id] = now
+        if not isinstance(meta, dict):
+            return None
+        value = meta.get("agent_mentions")
+        if value == "required":
+            return True
+        if value == "optional":
+            return False
+        return None
+
+    async def _thread_mention_policy(
+        self, channel_id: str, root_id: str, event: dict
+    ) -> Optional[bool]:
+        # A newly published root is already authoritative and avoids a relay
+        # round trip on the first message.
+        if str(event.get("id") or "") == root_id:
+            explicit = self._agent_mention_policy(event)
+            self._thread_policy_cache[root_id] = (explicit, time.monotonic())
+            return explicit
+
+        cached = self._thread_policy_cache.get(root_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < _THREAD_POLICY_TTL_SECONDS:
+            return cached[0]
+
+        code, out, _err = await self._run_cli(
+            [
+                "messages",
+                "thread",
+                "--channel",
+                channel_id,
+                "--event",
+                root_id,
+                "--root-only",
+            ]
+        )
+        explicit: Optional[bool] = None
+        if code == 0:
+            candidates = sorted(
+                _parse_json_list(out), key=lambda item: int(item.get("created_at") or 0)
+            )
+            for candidate in candidates:
+                candidate_id = str(candidate.get("id") or "")
+                kind = int(candidate.get("kind") or 0)
+                if candidate_id == root_id or kind == 40003:
+                    # Message edits are full tag snapshots. An edit without the
+                    # tag intentionally restores channel inheritance.
+                    explicit = self._agent_mention_policy(candidate)
+        self._thread_policy_cache[root_id] = (explicit, now)
+        return explicit
+
+    async def _effective_mention_required(
+        self, channel_id: str, event: dict
+    ) -> bool:
+        root_id = self._thread_root_id(event)
+        if root_id:
+            thread_policy = await self._thread_mention_policy(
+                channel_id, root_id, event
+            )
+            if thread_policy is not None:
+                return thread_policy
+
+        channel_policy = await self._refresh_channel_policy(channel_id)
+        if channel_policy is not None:
+            return channel_policy
+
+        # Backwards compatibility for relays that predate policy metadata.
+        if self.home_channel and channel_id == self.home_channel:
+            return False
+        return self.require_mention
 
     @staticmethod
     def _note_channel_kind(state: dict, event: dict) -> None:
@@ -2250,6 +2384,28 @@ class BuzzAdapter(BasePlatformAdapter):
             and str(tag[1]).strip()
         }
         return bool(targets) and self._self_pubkey not in targets
+
+    def _has_self_p_target(self, event: dict) -> bool:
+        """Whether a signed event semantically addresses this agent.
+
+        Orchestrated work deliberately keeps visible ``@Name`` text out of the
+        root so the coordinator cannot accidentally trigger specialists in its
+        own status message. The signed Nostr ``p`` tag is therefore the
+        authoritative assignment signal and must pass a mention-required gate
+        on its own.
+        """
+        if not self._self_pubkey:
+            return False
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        return any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "p"
+            and str(tag[1]).strip().lower() == self._self_pubkey
+            for tag in tags
+        )
 
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be

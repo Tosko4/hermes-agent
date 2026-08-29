@@ -294,6 +294,143 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_signed_self_p_tag_dispatches_without_visible_at_name(self, adapter):
+        event = _event(
+            "e1",
+            content="Primaire uitvoerder: Chip\nControleer de callbackketen.",
+            created_at=10,
+        )
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        await self._poll_with(adapter, event)
+
+        assert [item["message_id"] for item in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_channel_policy_can_enable_implicit_pickup(self, adapter):
+        cli = _ScriptedCli()
+        cli.script(
+            "channels",
+            "get",
+            {
+                "channel_id": CHANNEL,
+                "name": "research",
+                "agent_mentions": "optional",
+            },
+        )
+        cli.script(
+            "messages",
+            "get",
+            [_event("e1", content="investigate this", created_at=10)],
+        )
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [item["message_id"] for item in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_channel_policy_can_require_mentions_in_home(self, adapter):
+        adapter.home_channel = CHANNEL
+        cli = _ScriptedCli()
+        cli.script(
+            "channels",
+            "get",
+            {
+                "channel_id": CHANNEL,
+                "name": "nabu",
+                "agent_mentions": "required",
+            },
+        )
+        cli.script(
+            "messages",
+            "get",
+            [_event("e1", content="do not pick this up", created_at=10)],
+        )
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_thread_policy_overrides_required_channel(self, adapter):
+        root = _event("a" * 64, content="start", created_at=10)
+        root["tags"].extend(
+            [["subject", "Agent work"], ["agent_mentions", "optional"]]
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [root],
+        )
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [item["message_id"] for item in adapter._dispatched] == ["a" * 64]
+
+    def test_malformed_or_duplicate_thread_policy_fails_closed(self, adapter):
+        malformed = _event("a" * 64)
+        malformed["tags"].append(["agent_mentions", "sometimes"])
+        assert adapter._agent_mention_policy(malformed) is True
+
+        duplicate = _event("b" * 64)
+        duplicate["tags"].extend(
+            [
+                ["agent_mentions", "optional"],
+                ["agent_mentions", "optional"],
+            ]
+        )
+        assert adapter._agent_mention_policy(duplicate) is True
+
+    @pytest.mark.asyncio
+    async def test_latest_thread_edit_updates_policy_without_loading_history(
+        self, adapter
+    ):
+        root_id = "a" * 64
+        reply = _event("e1", content="continue", created_at=30)
+        reply["tags"].append(["e", root_id, "", "root"])
+        root = _event(root_id, content="start", created_at=10)
+        root["tags"].append(["subject", "Agent work"])
+        edit = _event("b" * 64, content="start", created_at=20, kind=40003)
+        edit["tags"].extend(
+            [
+                ["e", root_id],
+                ["subject", "Agent work"],
+                ["agent_mentions", "optional"],
+            ]
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "thread", [root, edit])
+        adapter._run_cli = cli
+
+        assert await adapter._effective_mention_required(CHANNEL, reply) is False
+        assert "--root-only" in cli.calls[0][0]
+
+    @pytest.mark.asyncio
+    async def test_optional_channel_respects_foreign_only_target(self, adapter):
+        event = _event("e1", content="@Cosmo own this", created_at=10)
+        event["tags"].append(["p", "b" * 64])
+        cli = _ScriptedCli()
+        cli.script(
+            "channels",
+            "get",
+            {
+                "channel_id": CHANNEL,
+                "name": "research",
+                "agent_mentions": "optional",
+            },
+        )
+        cli.script("messages", "get", [event])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
     async def test_unaddressed_specialist_message_is_observed_without_dispatch(
         self, adapter
     ):
@@ -387,6 +524,7 @@ class TestMentionGating:
     @pytest.mark.asyncio
     async def test_home_channel_does_not_require_a_mention(self, adapter):
         adapter.home_channel = CHANNEL
+        adapter._channel_policy_checked_at[CHANNEL] = float("inf")
         await self._poll_with(
             adapter, _event("e1", content="pick this up", created_at=10)
         )
@@ -395,6 +533,7 @@ class TestMentionGating:
     @pytest.mark.asyncio
     async def test_home_channel_does_not_capture_specialist_only_mention(self, adapter):
         adapter.home_channel = CHANNEL
+        adapter._channel_policy_checked_at[CHANNEL] = float("inf")
         adapter.observe_unaddressed_messages = True
         adapter._observe_unaddressed_message = AsyncMock()
         event = _event("e1", content="@Cosmo handle this", created_at=10)
@@ -410,6 +549,7 @@ class TestMentionGating:
         self, adapter
     ):
         adapter.home_channel = CHANNEL
+        adapter._channel_policy_checked_at[CHANNEL] = float("inf")
         event = _event("e1", content="@Chip and @Cosmo coordinate", created_at=10)
         event["tags"].extend([["p", SELF_PUBKEY], ["p", "b" * 64]])
 
@@ -422,6 +562,7 @@ class TestMentionGating:
         self, adapter
     ):
         adapter.home_channel = CHANNEL
+        adapter._channel_policy_checked_at[CHANNEL] = float("inf")
         adapter.observe_unaddressed_messages = True
         adapter._allowed_pubkeys = {OTHER_PUBKEY}
         adapter._observe_unaddressed_message = AsyncMock()
@@ -571,11 +712,15 @@ class TestDmClassification:
         assert len(adapter._dispatched) == 1
 
     @pytest.mark.asyncio
-    async def test_channel_like_metadata_blocks_latch_even_without_mention(
+    async def test_channel_like_metadata_blocks_dm_latch_but_keeps_semantic_target(
         self, adapter
     ):
-        """Second guard on its own: even a p-tagged, un-mentioned message
-        cannot reclassify a conversation whose metadata says real channel."""
+        """A p-tagged work root stays a group and reaches its assignee.
+
+        Coordinator-created roots intentionally omit visible ``@Name`` text,
+        so the signed p-tag is both the anti-DM evidence (via real channel
+        metadata) and the authoritative agent assignment signal.
+        """
         adapter._channel_meta[CHANNEL]["description"] = ""
         adapter._channel_meta[CHANNEL]["name"] = "announcements"
         await self._poll_with(
@@ -584,7 +729,7 @@ class TestDmClassification:
             _tagged_event("e1", CHANNEL, content="fyi everyone", p=SELF_PUBKEY),
         )
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
-        assert adapter._dispatched == []
+        assert [item["message_id"] for item in adapter._dispatched] == ["e1"]
 
     @pytest.mark.asyncio
     async def test_dm_shaped_channel_discovered_when_dms_list_empty(self):
@@ -614,10 +759,11 @@ class TestDmClassification:
         )
         a._run_cli = cli
         await a._discover_dms(seed=False)
-        # Watched as group; the p-tag latch flips it on the first real DM.
+        # With no explicit channel allow-list every newly joined conversation
+        # is watched. The p-tag latch still flips the DM on first real traffic.
         assert a._channel_state[DM_CHANNEL]["chat_type"] == "group"
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
-        assert CHANNEL not in a._channel_state
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
@@ -627,6 +773,23 @@ class TestDmClassification:
 class TestThreadRouting:
     def test_top_level_message_stays_in_channel_session(self):
         assert BuzzAdapter._thread_root_id(_event("root")) is None
+
+    def test_titled_stream_root_starts_thread_session(self):
+        event = _event("a" * 64)
+        event["tags"].append(["subject", "Focused work"])
+        assert BuzzAdapter._thread_root_id(event) == "a" * 64
+
+    def test_titled_root_edit_keeps_the_original_thread_session(self):
+        event = _event("b" * 64, kind=40003)
+        event["tags"].extend(
+            [["e", "a" * 64], ["subject", "Renamed focused work"]]
+        )
+        assert BuzzAdapter._thread_root_id(event) == "a" * 64
+
+    def test_forum_root_with_quoted_event_still_owns_its_session(self):
+        event = _event("a" * 64, kind=45001)
+        event["tags"].append(["e", "b" * 64])
+        assert BuzzAdapter._thread_root_id(event) == "a" * 64
 
     def test_direct_reply_continues_root_session(self):
         event = _event("reply")
@@ -949,6 +1112,37 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_completed_send_marks_only_final_response(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "final"})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "done", metadata={"notify": True})
+
+        assert "--final-response" in cli.calls[0][0]
+
+    @pytest.mark.asyncio
+    async def test_interim_send_never_marks_final_response(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "partial"})
+        adapter._run_cli = cli
+
+        await adapter.send(
+            CHANNEL,
+            "working",
+            metadata={"notify": True, "_interim_send": True},
+        )
+
+        assert "--final-response" not in cli.calls[0][0]
 
     @pytest.mark.asyncio
     async def test_top_level_group_response_does_not_create_thread(self):
