@@ -981,20 +981,16 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         # Explicit Buzz threads stay one level deep and always reply to their
-        # canonical outer root. Ordinary channel turns deliberately stay
-        # top-level: the gateway still supplies the triggering message as
+        # canonical outer root. Ordinary channel and DM turns deliberately
+        # stay top-level: the gateway still supplies the triggering message as
         # ``reply_to``, but turning that into a NIP-10 reply would silently
-        # manufacture a thread for every prompt. DMs retain their ordinary
-        # reply anchor because they are conversations rather than channels.
+        # manufacture a thread for every prompt.
         thread_id = (metadata or {}).get("thread_id")
         if (metadata or {}).get("notify") is True and not (metadata or {}).get(
             "_interim_send"
         ):
             args.append("--final-response")
-        chat_type = str(
-            self._channel_state.get(str(chat_id), {}).get("chat_type") or ""
-        )
-        reply_target = thread_id or (reply_to if chat_type != "group" else None)
+        reply_target = thread_id
         if reply_target:
             args += ["--reply-to", str(reply_target)]
             if self._channel_state.get(str(chat_id), {}).get("forum"):
@@ -1341,10 +1337,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "-",
             ]
             thread_id = (metadata or {}).get("thread_id")
-            chat_type = str(
-                self._channel_state.get(str(chat_id), {}).get("chat_type") or ""
-            )
-            reply_target = thread_id or (reply_to if chat_type != "group" else None)
+            reply_target = thread_id
             if reply_target:
                 args += ["--reply-to", str(reply_target)]
                 if self._channel_state.get(str(chat_id), {}).get("forum"):
@@ -2028,13 +2021,23 @@ class BuzzAdapter(BasePlatformAdapter):
         return None
 
     @staticmethod
-    def _agent_mention_policy(event: dict) -> Optional[bool]:
-        """Return an explicit required/optional policy, or None to inherit."""
+    def _agent_mention_policy(
+        event: dict, agent_pubkey: str = ""
+    ) -> Optional[bool]:
+        """Return this agent's explicit policy, or None to inherit.
+
+        A two-field tag defines the location default. Three-field tags define
+        stable pubkey-specific overrides and take precedence for that agent.
+        Malformed or duplicate applicable policy fails closed.
+        """
         tags = event.get("tags")
         if not isinstance(tags, list):
             return None
-        policy: Optional[bool] = None
-        found = False
+        default_policy: Optional[bool] = None
+        default_found = False
+        target_policy: Optional[bool] = None
+        target_found = False
+        normalized_agent = agent_pubkey.strip().lower()
         for tag in tags:
             if not isinstance(tag, (list, tuple)) or not tag:
                 continue
@@ -2044,11 +2047,27 @@ class BuzzAdapter(BasePlatformAdapter):
             # channel metadata. Treat malformed or duplicate policy tags as
             # mention-required instead of accidentally inheriting an optional
             # channel policy.
-            if found or len(tag) != 2 or tag[1] not in {"required", "optional"}:
+            if len(tag) == 2:
+                if default_found or tag[1] not in {"required", "optional"}:
+                    return True
+                default_found = True
+                default_policy = tag[1] == "required"
+                continue
+            if len(tag) != 3 or not isinstance(tag[1], str):
                 return True
-            found = True
-            policy = tag[1] == "required"
-        return policy
+            target = tag[1].strip().lower()
+            if len(target) != 64 or any(c not in "0123456789abcdef" for c in target):
+                return True
+            if target != normalized_agent:
+                continue
+            if target_found or tag[2] not in {"required", "optional", "inherit"}:
+                return True
+            target_found = True
+            if tag[2] == "inherit":
+                target_policy = None
+            else:
+                target_policy = tag[2] == "required"
+        return target_policy if target_found and target_policy is not None else default_policy
 
     async def _refresh_channel_policy(self, channel_id: str) -> Optional[bool]:
         now = time.monotonic()
@@ -2071,6 +2090,13 @@ class BuzzAdapter(BasePlatformAdapter):
             self._channel_policy_checked_at[channel_id] = now
         if not isinstance(meta, dict):
             return None
+        overrides = meta.get("agent_mention_overrides")
+        if isinstance(overrides, dict) and self._self_pubkey:
+            value = overrides.get(self._self_pubkey.lower())
+            if value == "required":
+                return True
+            if value == "optional":
+                return False
         value = meta.get("agent_mentions")
         if value == "required":
             return True
@@ -2084,7 +2110,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # A newly published root is already authoritative and avoids a relay
         # round trip on the first message.
         if str(event.get("id") or "") == root_id:
-            explicit = self._agent_mention_policy(event)
+            explicit = self._agent_mention_policy(event, self._self_pubkey)
             self._thread_policy_cache[root_id] = (explicit, time.monotonic())
             return explicit
 
@@ -2115,7 +2141,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 if candidate_id == root_id or kind == 40003:
                     # Message edits are full tag snapshots. An edit without the
                     # tag intentionally restores channel inheritance.
-                    explicit = self._agent_mention_policy(candidate)
+                    explicit = self._agent_mention_policy(candidate, self._self_pubkey)
         self._thread_policy_cache[root_id] = (explicit, now)
         return explicit
 

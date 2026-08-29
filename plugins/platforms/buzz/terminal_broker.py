@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import select
 import shutil
 import signal
@@ -46,20 +45,52 @@ MAX_COLS = 400
 MIN_ROWS = 5
 MAX_ROWS = 200
 
-_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
-_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_ESC_RE = re.compile(r"\x1b[@-_][0-?]*")
-
 DecryptEvent = Callable[[dict], Awaitable[dict]]
 PublishTelemetry = Callable[[dict], Awaitable[bool]]
 
 
 def _clean_terminal_text(value: str) -> str:
     """Return inert text: preserve layout, remove terminal-control sequences."""
-    value = _OSC_RE.sub("", value)
-    value = _CSI_RE.sub("", value)
-    value = _ESC_RE.sub("", value)
-    return "".join(ch for ch in value if ch in "\n\r\t" or ord(ch) >= 32)
+    return _TerminalControlSanitizer().feed(value)
+
+
+class _TerminalControlSanitizer:
+    """Strip terminal controls incrementally across arbitrary PTY chunks."""
+
+    def __init__(self) -> None:
+        self._state = "ground"
+
+    def feed(self, value: str) -> str:
+        output: list[str] = []
+        for char in value:
+            code = ord(char)
+            if self._state == "ground":
+                if char == "\x1b":
+                    self._state = "escape"
+                elif code == 0x9B:
+                    self._state = "csi"
+                elif code == 0x9D:
+                    self._state = "osc"
+                elif char in "\n\r\t" or code >= 0xA0 or 0x20 <= code < 0x7F:
+                    output.append(char)
+            elif self._state == "escape":
+                if char == "[":
+                    self._state = "csi"
+                elif char == "]":
+                    self._state = "osc"
+                else:
+                    self._state = "ground"
+            elif self._state == "csi":
+                if 0x40 <= code <= 0x7E:
+                    self._state = "ground"
+            elif self._state == "osc":
+                if char == "\x07" or code == 0x9C:
+                    self._state = "ground"
+                elif char == "\x1b":
+                    self._state = "osc_escape"
+            elif self._state == "osc_escape":
+                self._state = "ground" if char == "\\" else "osc"
+        return "".join(output)
 
 
 def _canonical_uuid(value: Any, field_name: str) -> str:
@@ -130,6 +161,9 @@ class _Session:
     output_truncated: bool = False
     decoder: Any = field(
         default_factory=lambda: codecs.getincrementaldecoder("utf-8")(errors="replace")
+    )
+    sanitizer: _TerminalControlSanitizer = field(
+        default_factory=_TerminalControlSanitizer
     )
 
     @property
@@ -669,7 +703,7 @@ class TerminalBroker:
     def _queue_output(self, session: _Session, raw: bytes) -> None:
         if not raw:
             return
-        text = _clean_terminal_text(session.decoder.decode(raw))
+        text = session.sanitizer.feed(session.decoder.decode(raw))
         if not text:
             return
         encoded = text.encode("utf-8")

@@ -10,6 +10,7 @@ from plugins.platforms.buzz.terminal_broker import (
     PROTOCOL_KIND,
     PROTOCOL_VERSION,
     TerminalBroker,
+    _TerminalControlSanitizer,
     _clean_terminal_text,
     _guard_command_sync,
 )
@@ -274,3 +275,20 @@ def test_hardline_guard_blocks_even_in_gateway_context():
 def test_terminal_output_is_rendered_as_inert_text():
     raw = "safe\x1b]52;c;ZXZpbA==\x07\x1b[31mred\x1b[0m\x00\n"
     assert _clean_terminal_text(raw) == "safered\n"
+
+
+def test_terminal_controls_are_removed_when_split_across_pty_reads():
+    sanitizer = _TerminalControlSanitizer()
+
+    assert sanitizer.feed("safe\x1b[3") == "safe"
+    assert sanitizer.feed("1mred\x1b[0m\x1b]52;c;ZX") == "red"
+    assert sanitizer.feed("ZpbA==\x07\r100%\n") == "\r100%\n"
+
+
+def test_terminal_control_sanitizer_drops_c0_del_and_c1_controls():
+    assert _clean_terminal_text("ok\x00\x1f\x7f\x85 hé") == "ok hé"
+
+
+def test_terminal_control_sanitizer_consumes_c1_csi_and_osc_sequences():
+    raw = "safe\x9b31mred\x9b0m\x9d52;c;ZXZpbA==\x9c done"
+    assert _clean_terminal_text(raw) == "safered done"
