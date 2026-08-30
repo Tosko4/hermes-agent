@@ -132,6 +132,13 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
+def _mark_interim_notify_metadata(metadata: dict | None) -> dict:
+    """Mark a visible mid-run reply without claiming the turn-final slot."""
+    interim_metadata = _mark_notify_metadata(metadata)
+    interim_metadata["_interim_send"] = True
+    return interim_metadata
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -6254,7 +6261,7 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_mark_interim_notify_metadata(_thread_meta),
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
