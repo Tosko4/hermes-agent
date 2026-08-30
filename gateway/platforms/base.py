@@ -6210,6 +6210,52 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
 
+        # A Buzz stream thread can be opened by replying to an ordinary
+        # top-level channel message.  The initiating turn was keyed to the
+        # channel because no thread existed yet, while the reply correctly
+        # carries the new outer-root id.  Mid-run slash commands still belong
+        # to that initiating turn: resolve the active parent-channel guard as
+        # a narrow fallback so /steer and every other registered command use
+        # the bypass path and publish a real interim acknowledgement.  Normal
+        # replies and already-established/titled threads retain their exact
+        # thread session keys.
+        if (
+            session_key not in self._active_sessions
+            and _platform_name(event.source.platform) == "buzz"
+            and bool(getattr(event.source, "thread_id", None))
+            and event.is_command()
+        ):
+            from hermes_cli.commands import should_bypass_active_session
+
+            command = event.get_command()
+            if should_bypass_active_session(command):
+                parent_source = dataclasses.replace(
+                    event.source,
+                    thread_id=None,
+                    prospective_thread_id=None,
+                )
+                parent_session_key = build_session_key(
+                    parent_source,
+                    group_sessions_per_user=self.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=self.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=self._session_key_profile(parent_source),
+                )
+                if parent_session_key in self._active_sessions:
+                    self._heal_stale_session_lock(parent_session_key)
+                if parent_session_key in self._active_sessions:
+                    logger.debug(
+                        "[%s] Buzz thread command '/%s' inherits active "
+                        "channel session %s",
+                        self.name,
+                        command,
+                        parent_session_key,
+                    )
+                    session_key = parent_session_key
+
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
             # Certain commands must bypass the active-session guard and be
