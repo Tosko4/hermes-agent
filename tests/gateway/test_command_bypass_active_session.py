@@ -432,6 +432,11 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         request = adapter.sent_requests[-1]
         assert request["reply_to"] == f"command-{surface}"
         assert request["metadata"]["thread_id"] == thread_id
+        assert request["metadata"]["notify"] is True
+        assert request["metadata"]["_interim_send"] is True, (
+            f"/{command_name} acknowledgement claimed the final-response slot "
+            f"in {surface}"
+        )
 
 
 # ---------------------------------------------------------------------------
