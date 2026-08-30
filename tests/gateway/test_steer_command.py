@@ -104,8 +104,7 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     result = await runner._handle_message(_make_event("/steer also check auth.log"))
 
     # The handler replied with a confirmation
-    assert result is not None
-    assert "steer" in result.lower() or "queued" in result.lower()
+    assert result == "Steering: also check auth.log"
     # The agent's steer() was called with the payload (prefix stripped)
     running_agent.steer.assert_called_once_with("also check auth.log")
     # Critically: interrupt was NOT called

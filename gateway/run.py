@@ -16725,8 +16725,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Steer failed for session %s: %s", quick_key, exc)
                 return f"⚠️ Steer failed: {exc}"
             if accepted:
-                preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+                # Keep the acknowledgement distinct from /queue.  Buzz users
+                # rely on this visible response inside a thread/topic to know
+                # that the prompt was injected into the *current* turn.
+                return f"Steering: {steer_text}"
             return "Steer rejected (empty payload)."
         # Running agent is missing or lacks steer() — fall back to queue.
         adapter = self._adapter_for_source(source)

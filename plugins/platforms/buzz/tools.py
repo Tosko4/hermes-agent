@@ -55,6 +55,27 @@ def _orchestration_config(config: Mapping[str, Any] | None = None) -> dict:
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
+def _route_has_valid_primary(
+    orchestration: Mapping[str, Any], route: Mapping[str, Any]
+) -> bool:
+    """Return whether a route primary names one of its allowed specialists."""
+    primary = str(
+        route.get("primary_agent") or orchestration.get("primary_agent") or ""
+    ).strip()
+    if not primary:
+        return False
+
+    route_agents = route.get("agents")
+    if isinstance(route_agents, Mapping):
+        names = route_agents.keys()
+    elif isinstance(route_agents, list):
+        names = route_agents
+    else:
+        return False
+    allowed = {str(name).strip().lower() for name in names if str(name).strip()}
+    return primary.lower() in allowed
+
+
 def _normalize_pubkey(value: Any) -> str:
     text = str(value or "").strip().lower()
     if _HEX_PUBKEY.fullmatch(text):
@@ -87,7 +108,13 @@ def _orchestration_configured(config: Mapping[str, Any] | None = None) -> bool:
     # validation runs in the per-call authorization path below.
     allowed = {str(value).strip() for value in raw_allowed if str(value).strip()}
     routes = orchestration.get("routes")
-    return bool(allowed and isinstance(routes, Mapping) and routes)
+    if not allowed or not isinstance(routes, Mapping) or not routes:
+        return False
+    return all(
+        isinstance(route, Mapping)
+        and _route_has_valid_primary(orchestration, route)
+        for route in routes.values()
+    )
 
 
 def _configured_owner(config: Mapping[str, Any] | None = None) -> bool:
