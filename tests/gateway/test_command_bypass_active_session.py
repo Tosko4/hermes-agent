@@ -13,12 +13,24 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
+from hermes_cli.commands import COMMAND_REGISTRY, is_interrupt_then_dispatch
+
+
+BUZZ_GATEWAY_COMMAND_NAMES = tuple(
+    sorted(
+        name
+        for command in COMMAND_REGISTRY
+        if not command.cli_only or command.gateway_config_gate
+        for name in (command.name, *command.aliases)
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -42,12 +54,13 @@ class _StubAdapter(BasePlatformAdapter):
         return {}
 
 
-def _make_adapter():
+def _make_adapter(platform=Platform.TELEGRAM):
     """Create a minimal adapter for testing the active-session guard."""
     config = PlatformConfig(enabled=True, token="test-token")
-    adapter = _StubAdapter(config, Platform.TELEGRAM)
+    adapter = _StubAdapter(config, platform)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
+    adapter.sent_requests = []
 
     async def _mock_handler(event):
         cmd = event.get_command()
@@ -57,6 +70,9 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        adapter.sent_requests.append(
+            {"chat_id": chat_id, "content": content, **kwargs}
+        )
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -74,6 +90,35 @@ def _session_key(chat_id="12345"):
         platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
     )
     return build_session_key(source)
+
+
+def _make_buzz_event(text: str, *, thread_id: str, message_id: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform("buzz"),
+        user_id="buzz-user",
+        chat_id="buzz-channel",
+        chat_type="group",
+        thread_id=thread_id,
+    )
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=message_id,
+    )
+
+
+def _buzz_session_key(thread_id: str) -> str:
+    return build_session_key(
+        SessionSource(
+            platform=Platform("buzz"),
+            user_id="buzz-user",
+            chat_id="buzz-channel",
+            chat_type="group",
+            thread_id=thread_id,
+        ),
+        thread_sessions_per_user=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +388,52 @@ class TestAllResolvableCommandsBypassGuard:
         assert should_bypass_active_session("path/to/file.py") is False
 
 
+class TestEveryBuzzCommandInThreadsAndForumTopics:
+    """The complete gateway command registry keeps thread/topic routing.
+
+    A command sent while an agent owns the session must never become ordinary
+    pending user text. Non-interrupting commands must also publish their
+    acknowledgement back to the exact Buzz root that received the command.
+    """
+
+    @pytest.mark.parametrize(
+        ("surface", "thread_id"),
+        (("stream-thread", "a" * 64), ("forum-topic", "b" * 64)),
+    )
+    @pytest.mark.parametrize("command_name", BUZZ_GATEWAY_COMMAND_NAMES)
+    @pytest.mark.asyncio
+    async def test_registered_command_bypasses_and_keeps_root(
+        self, surface, thread_id, command_name
+    ):
+        adapter = _make_adapter(Platform("buzz"))
+        event = _make_buzz_event(
+            f"/{command_name} regression payload",
+            thread_id=thread_id,
+            message_id=f"command-{surface}",
+        )
+        session_key = _buzz_session_key(thread_id)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._dispatch_active_session_command = AsyncMock()
+
+        await adapter.handle_message(event)
+
+        assert session_key not in adapter._pending_messages, (
+            f"/{command_name} was queued as user text in {surface}"
+        )
+        if is_interrupt_then_dispatch(command_name):
+            adapter._dispatch_active_session_command.assert_awaited_once_with(
+                event, session_key, command_name
+            )
+            return
+
+        assert adapter.sent_requests, (
+            f"/{command_name} produced no visible response in {surface}"
+        )
+        request = adapter.sent_requests[-1]
+        assert request["reply_to"] == f"command-{surface}"
+        assert request["metadata"]["thread_id"] == thread_id
+
+
 # ---------------------------------------------------------------------------
 # Tests: non-bypass messages still get queued
 # ---------------------------------------------------------------------------
@@ -438,4 +529,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-

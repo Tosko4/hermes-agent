@@ -46,6 +46,13 @@ def _config():
                             "allowed_users": [OWNER],
                             "agents": {"Cosmo": AGENT, "Dash": SECOND_AGENT},
                             "routes": {
+                                "lcm-x": {
+                                    "channel_id": TARGET,
+                                    "label": "LCM-X",
+                                    "kind": "forum",
+                                    "agents": ["Cosmo", "Dash"],
+                                    "primary_agent": "Dash",
+                                },
                                 "research": {
                                     "channel_id": TARGET,
                                     "label": "research",
@@ -152,6 +159,42 @@ async def test_creates_titled_forum_root_with_exact_mentions_and_origin(
     assert "Primaire uitvoerder: Cosmo" in kwargs["input_text"]
     assert "@Cosmo" not in kwargs["input_text"]
     assert next(iter(state.values.values()))["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_lcm_x_without_explicit_agent_routes_to_dash(configured, monkeypatch):
+    calls = []
+
+    async def fake_exec(path, args, **kwargs):
+        calls.append((path, args, kwargs))
+        return (
+            0,
+            json.dumps(
+                {
+                    "event_id": RESULT_EVENT,
+                    "accepted": True,
+                    "mention_pubkeys": [SECOND_AGENT],
+                    "callback_pubkey": COORDINATOR,
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(buzz_adapter, "_exec_buzz", fake_exec)
+    result = await buzz_tools.buzz_orchestrate(
+        {
+            "route": "lcm-x",
+            "title": "Controleer LCM-X",
+            "task": "Voer de afgebakende LCM-X-controle uit.",
+        },
+        state=FakeState(),
+    )
+
+    assert "Toegewezen aan: Dash" in result
+    assert len(calls) == 1
+    _, args, kwargs = calls[0]
+    assert args[-2:] == ["--mention", SECOND_AGENT]
+    assert "Primaire uitvoerder: Dash" in kwargs["input_text"]
 
 
 @pytest.mark.asyncio
@@ -440,6 +483,23 @@ def test_static_gate_rejects_incomplete_configuration(monkeypatch):
     broken["gateway"]["platforms"]["buzz"]["extra"]["orchestration"][
         "allowed_users"
     ] = []
+    monkeypatch.setattr(buzz_tools, "_runtime_config", lambda: broken)
+
+    assert buzz_tools._orchestration_configured() is False
+
+
+@pytest.mark.parametrize("primary", [None, "Mallory"])
+def test_static_gate_rejects_missing_or_disallowed_route_primary(
+    monkeypatch, primary
+):
+    broken = _config()
+    route = broken["gateway"]["platforms"]["buzz"]["extra"]["orchestration"][
+        "routes"
+    ]["lcm-x"]
+    if primary is None:
+        route.pop("primary_agent")
+    else:
+        route["primary_agent"] = primary
     monkeypatch.setattr(buzz_tools, "_runtime_config", lambda: broken)
 
     assert buzz_tools._orchestration_configured() is False

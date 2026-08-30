@@ -918,31 +918,234 @@ class TestThreadRouting:
         assert called is False
 
     @pytest.mark.asyncio
-    async def test_selected_message_context_is_hydrated_without_changing_content(self):
+    async def test_selected_message_context_uses_exact_event_reads_in_order(self):
         adapter = _make_adapter()
         first = "1" * 64
         second = "2" * 64
         cli = _ScriptedCli()
         cli.script(
             "messages",
-            "thread",
-            [{"id": first, "pubkey": "a" * 64, "content": "first full message"}],
+            "get",
+            [
+                {
+                    "id": first,
+                    "pubkey": "a" * 64,
+                    "content": "first full message",
+                    "created_at": 1,
+                }
+            ],
         )
         cli.script(
             "messages",
-            "thread",
-            [{"id": second, "pubkey": "b" * 64, "content": "second full message"}],
+            "get",
+            [
+                {
+                    "id": second,
+                    "pubkey": "b" * 64,
+                    "content": "second full message",
+                    "created_at": 2,
+                }
+            ],
         )
         adapter._run_cli = cli
         event = _event("reply")
         event["tags"].extend([["q", first], ["q", second]])
 
-        context = await adapter._load_quoted_context(CHANNEL, event)
+        selected, missing = await adapter._load_quoted_events(CHANNEL, event)
 
-        assert "first full message" in context
-        assert "second full message" in context
+        assert [candidate["content"] for candidate in selected] == [
+            "first full message",
+            "second full message",
+        ]
+        assert missing == []
         assert len(cli.calls) == 2
-        assert all("--depth-limit" in args for args, _stdin in cli.calls)
+        assert [args[-1] for args, _stdin in cli.calls] == [first, second]
+        assert all(args[:2] == ["messages", "get"] for args, _stdin in cli.calls)
+
+    @pytest.mark.asyncio
+    async def test_selected_long_message_is_hydrated_before_session_seed(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        selected_id = "3" * 64
+        payload = ("lossless selected context\n" + "detail\n" * 512).encode()
+        digest = _buzz_mod.hashlib.sha256(payload).hexdigest()
+        marker = (
+            "The complete lossless message is attached as buzz-message.md.\n"
+            "[buzz-message.md](https://test.relay/media/selected)"
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [
+                {
+                    "id": selected_id,
+                    "pubkey": "a" * 64,
+                    "content": marker,
+                    "created_at": 1,
+                    "tags": [
+                        [
+                            "imeta",
+                            "url https://test.relay/media/selected",
+                            "m application/octet-stream",
+                            f"x {digest}",
+                            f"size {len(payload)}",
+                            "filename buzz-message.md",
+                        ]
+                    ],
+                }
+            ],
+        )
+        adapter._run_cli = cli
+
+        async def download(_args):
+            return 0, payload, ""
+
+        monkeypatch.setattr(adapter, "_run_cli_bytes", download)
+        event = _event("f" * 64)
+        event["tags"].append(["q", selected_id])
+
+        selected, missing = await adapter._load_quoted_events(CHANNEL, event)
+
+        assert missing == []
+        assert selected[0]["content"] == payload.decode()
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_selected_long_message_is_reported_missing(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        selected_id = "4" * 64
+        marker = (
+            "The complete lossless message is attached as buzz-message.md.\n"
+            "[buzz-message.md](https://test.relay/media/selected)"
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [
+                {
+                    "id": selected_id,
+                    "pubkey": "a" * 64,
+                    "content": marker,
+                    "tags": [
+                        [
+                            "imeta",
+                            "url https://test.relay/media/selected",
+                            f"x {'a' * 64}",
+                            "size 12",
+                            "filename buzz-message.md",
+                        ]
+                    ],
+                }
+            ],
+        )
+        adapter._run_cli = cli
+
+        async def failed_download(_args):
+            return 2, b"", "unavailable"
+
+        monkeypatch.setattr(adapter, "_run_cli_bytes", failed_download)
+        event = _event("f" * 64)
+        event["tags"].append(["q", selected_id])
+
+        selected, missing = await adapter._load_quoted_events(CHANNEL, event)
+
+        assert selected == []
+        assert missing == [selected_id]
+
+    @pytest.mark.asyncio
+    async def test_selected_context_over_eight_items_is_seeded_once_in_order(self):
+        adapter = _make_adapter()
+        adapter._resolve_user_name = AsyncMock(side_effect=lambda pk: f"user-{pk[0]}")
+        selected = [
+            {
+                "id": f"{index:x}" * 64,
+                "pubkey": f"{index + 1:x}" * 64,
+                "content": f"complete selected message {index}",
+                "created_at": 100 + index,
+            }
+            for index in range(10)
+        ]
+        persisted = []
+        store = MagicMock()
+        store.get_or_create_session.return_value.session_id = "fresh-thread-session"
+        store.load_transcript.side_effect = lambda _session_id: list(persisted)
+
+        def append(_session_id, message):
+            persisted.append(message)
+
+        store.append_to_transcript.side_effect = append
+        adapter.set_session_store(store)
+        root_id = "f" * 64
+        event = _event(root_id, content="start the work")
+        event["tags"].append(["subject", "Fresh selected-context thread"])
+
+        first_error = await adapter._seed_selected_context(
+            channel_id=CHANNEL,
+            event=event,
+            thread_id=root_id,
+            selected=selected,
+        )
+        second_error = await adapter._seed_selected_context(
+            channel_id=CHANNEL,
+            event=event,
+            thread_id=root_id,
+            selected=selected,
+        )
+
+        assert first_error == ""
+        assert second_error == ""
+        assert store.append_to_transcript.call_count == 10
+        assert [
+            json.loads(message["content"])["content"] for message in persisted
+        ] == [f"complete selected message {index}" for index in range(10)]
+        assert all(message["observed"] is True for message in persisted)
+        source = store.get_or_create_session.call_args_list[0].args[0]
+        assert source.thread_id == root_id
+        assert source.message_id == root_id
+
+    @pytest.mark.asyncio
+    async def test_missing_selected_context_fails_closed_before_agent_dispatch(self):
+        adapter = _make_adapter({"home_channel": CHANNEL})
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "forum": False,
+            "last_ts": 0,
+            "seen": {},
+        }
+        first = "1" * 64
+        missing = "2" * 64
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [{"id": first, "pubkey": "a" * 64, "content": "available"}],
+        )
+        cli.script("messages", "get", [], code=2, stderr="unavailable")
+        adapter._run_cli = cli
+        adapter.send = AsyncMock()
+        adapter._dispatch_message = AsyncMock()
+        root = _event("f" * 64, content="start", created_at=10)
+        root["tags"].extend(
+            [
+                ["subject", "Fresh work"],
+                ["agent_mentions", "optional"],
+                ["q", first],
+                ["q", missing],
+            ]
+        )
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], root)
+
+        adapter._dispatch_message.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        assert "No partial context" in adapter.send.await_args.args[1]
+        assert adapter.send.await_args.kwargs["metadata"] == {
+            "thread_id": "f" * 64
+        }
 
     @pytest.mark.asyncio
     async def test_dispatch_carries_stable_thread_and_message_anchor(self):
@@ -997,6 +1200,45 @@ class TestThreadRouting:
 
         dispatched = adapter.handle_message.await_args.args[0]
         assert dispatched.auto_skill == ["research", "summarize"]
+
+    @pytest.mark.asyncio
+    async def test_addressed_forum_turn_acknowledges_before_processing(self):
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        order = []
+
+        async def react(chat_id, message_id, emoji):
+            order.append(("reaction", chat_id, message_id, emoji))
+            return True
+
+        async def handle(event):
+            order.append(
+                (
+                    "handle",
+                    event.source.chat_id,
+                    event.message_id,
+                    event.source.thread_id,
+                )
+            )
+
+        adapter.send_reaction = react
+        adapter.handle_message = handle
+
+        await adapter._dispatch_message(
+            text="@Chip investigate",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Alice",
+            message_id="f" * 64,
+            created_at=10,
+            thread_id="a" * 64,
+        )
+
+        assert order == [
+            ("reaction", CHANNEL, "f" * 64, "👀"),
+            ("handle", CHANNEL, "f" * 64, "a" * 64),
+        ]
 
 
 class TestLiveActivity:

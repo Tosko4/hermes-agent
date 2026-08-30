@@ -1865,15 +1865,34 @@ class BuzzAdapter(BasePlatformAdapter):
         # /whoami) and clean prompts are recognized. DM messages often still
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
-        dispatch_text = self._strip_mention(content)
-        quoted_context = await self._load_quoted_context(channel_id, event)
-        if quoted_context:
-            dispatch_text = (
-                "The user explicitly selected these earlier Buzz messages as context "
-                "for this thread:\n\n"
-                f"{quoted_context}\n\nCurrent message:\n{dispatch_text}"
-            )
         thread_id = None if is_dm else self._thread_root_id(event)
+        quoted_event_ids = self._quoted_event_ids(event)
+        if quoted_event_ids:
+            selected, missing = await self._load_quoted_events(channel_id, event)
+            if missing:
+                await self.send(
+                    channel_id,
+                    "I could not start this turn because some selected Buzz context "
+                    "could not be loaded and verified. No partial context was sent "
+                    "to the agent; retry after the source messages are available.",
+                    metadata={"thread_id": thread_id} if thread_id else None,
+                )
+                return
+            seed_error = await self._seed_selected_context(
+                channel_id=channel_id,
+                event=event,
+                thread_id=thread_id,
+                selected=selected,
+            )
+            if seed_error:
+                await self.send(
+                    channel_id,
+                    f"I could not start this turn with its selected context: {seed_error}",
+                    metadata={"thread_id": thread_id} if thread_id else None,
+                )
+                return
+
+        dispatch_text = self._strip_mention(content)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -2197,52 +2216,160 @@ class BuzzAdapter(BasePlatformAdapter):
                 result.append(event_id)
         return result
 
-    async def _load_quoted_context(self, channel_id: str, event: dict) -> str:
-        """Hydrate all explicitly selected thread context without truncation.
+    async def _load_quoted_events(
+        self, channel_id: str, event: dict
+    ) -> tuple[list[dict], list[str]]:
+        """Load every selected event exactly, preserving selection order.
 
         Android adds standard NIP-18 ``q`` tags to the first and subsequent
-        messages in a user-created thread. Each selected item is a top-level
-        channel message, so ``messages thread`` can fetch it exactly. Fetches
-        run in small batches to preserve an unbounded UX without spawning an
-        unbounded number of CLI processes.
+        messages in a user-created thread. ``messages get --event`` performs an
+        exact ID lookup plus channel-boundary verification; using
+        ``messages thread --limit 1`` here used to omit selected replies in a
+        busy thread. Fetches run in small batches so selection count does not
+        create unbounded process concurrency.
         """
         event_ids = self._quoted_event_ids(event)
         if not event_ids:
-            return ""
+            return [], []
 
         async def fetch(event_id: str) -> Optional[dict]:
             code, out, _err = await self._run_cli([
                 "messages",
-                "thread",
+                "get",
                 "--channel",
                 str(channel_id),
                 "--event",
                 event_id,
-                "--limit",
-                "1",
-                "--depth-limit",
-                "0",
             ])
             if code != 0:
                 return None
             for candidate in _parse_json_list(out):
                 if str(candidate.get("id") or "").lower() == event_id:
-                    return candidate
+                    body = candidate.get("content")
+                    if not isinstance(body, str) or not body.strip():
+                        return None
+                    hydrated = await self._hydrate_long_message_attachment(
+                        candidate, body
+                    )
+                    if body.startswith(_LONG_MESSAGE_MARKER) and hydrated == body:
+                        return None
+                    return {**candidate, "content": hydrated}
             return None
 
-        selected: list[dict] = []
+        resolved: dict[str, dict] = {}
         for offset in range(0, len(event_ids), 8):
             batch = await asyncio.gather(
                 *(fetch(event_id) for event_id in event_ids[offset : offset + 8])
             )
-            selected.extend(candidate for candidate in batch if candidate is not None)
+            for candidate in batch:
+                if candidate is not None:
+                    resolved[str(candidate.get("id") or "").lower()] = candidate
 
-        rows = []
-        for candidate in selected:
-            author = str(candidate.get("pubkey") or "unknown")[:12]
-            body = str(candidate.get("content") or "")
-            rows.append(f"[{author}]\n{body}")
-        return "\n\n".join(rows)
+        missing = [event_id for event_id in event_ids if event_id not in resolved]
+        return [resolved[event_id] for event_id in event_ids if event_id in resolved], missing
+
+    async def _seed_selected_context(
+        self,
+        *,
+        channel_id: str,
+        event: dict,
+        thread_id: Optional[str],
+        selected: list[dict],
+    ) -> str:
+        """Persist selected context before the first turn in its thread session.
+
+        The context becomes prior observed transcript state instead of being
+        flattened into the current user prompt. That gives context engines such
+        as LCM-X the same stable session/history input as ordinary earlier
+        messages. Source-event markers make replay after reconnect idempotent.
+        """
+        if not selected:
+            return "no selected messages were resolved"
+        if not thread_id:
+            return "the selected messages are not attached to a canonical thread root"
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return "the session store is unavailable"
+
+        event_id = str(event.get("id") or "")
+        pubkey = str(event.get("pubkey") or "").lower()
+        try:
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_name=self._channel_names.get(channel_id, channel_id),
+                chat_type="group",
+                user_id=pubkey,
+                user_name=await self._resolve_user_name(pubkey),
+                thread_id=thread_id,
+                message_id=event_id,
+            )
+            session_entry = store.get_or_create_session(source)
+            transcript = store.load_transcript(session_entry.session_id)
+        except Exception as exc:
+            logger.warning("Buzz: selected-context session bootstrap failed: %s", exc)
+            return "the fresh thread session could not be initialized"
+
+        already_seeded: set[str] = set()
+        for message in transcript or []:
+            metadata = message.get("display_metadata")
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("selected_context_root") != thread_id:
+                continue
+            source_event_id = str(metadata.get("source_event_id") or "").lower()
+            if source_event_id:
+                already_seeded.add(source_event_id)
+
+        total = len(selected)
+        try:
+            for index, candidate in enumerate(selected, start=1):
+                source_event_id = str(candidate.get("id") or "").lower()
+                if source_event_id in already_seeded:
+                    continue
+                author_pubkey = str(candidate.get("pubkey") or "").lower()
+                author_name = await self._resolve_user_name(author_pubkey)
+                body = str(candidate.get("content") or "")
+                structured = json.dumps(
+                    {
+                        "type": "selected_buzz_context",
+                        "index": index,
+                        "total": total,
+                        "event_id": source_event_id,
+                        "author": {
+                            "name": author_name or author_pubkey,
+                            "pubkey": author_pubkey,
+                        },
+                        "content": body,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                created_at = int(candidate.get("created_at") or 0)
+                store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "user",
+                        "content": structured,
+                        "timestamp": (
+                            datetime.fromtimestamp(created_at).isoformat()
+                            if created_at
+                            else datetime.now().isoformat()
+                        ),
+                        "platform_message_id": source_event_id,
+                        "observed": True,
+                        "display_kind": "selected_context",
+                        "display_metadata": {
+                            "selected_context_root": thread_id,
+                            "source_event_id": source_event_id,
+                            "index": index,
+                            "total": total,
+                        },
+                    },
+                )
+        except Exception as exc:
+            logger.warning("Buzz: selected-context transcript seed failed: %s", exc)
+            return "the selected messages could not be persisted losslessly"
+        return ""
 
     async def _observe_unaddressed_message(
         self,
@@ -2540,16 +2667,17 @@ class BuzzAdapter(BasePlatformAdapter):
             auto_skill=resolve_channel_skills(self._extra, chat_id),
         )
 
-        await self.handle_message(event)
-
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
+        # Acknowledge receipt before processing. Every addressed profile owns a
+        # separate adapter/key, so multi-agent mentions produce one auditable
+        # reaction per agent without making the user wait for a long turn.
         try:
             await self.send_reaction(chat_id, message_id, "👀")
         except Exception:
             logger.debug(
                 "Buzz: reaction failed for message %s", message_id[:12], exc_info=True
             )
+
+        await self.handle_message(event)
 
 
 # ---------------------------------------------------------------------------
