@@ -121,6 +121,18 @@ def _buzz_session_key(thread_id: str) -> str:
     )
 
 
+def _buzz_channel_session_key() -> str:
+    return build_session_key(
+        SessionSource(
+            platform=Platform("buzz"),
+            user_id="buzz-user",
+            chat_id="buzz-channel",
+            chat_type="group",
+        ),
+        thread_sessions_per_user=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests: commands bypass Level 1 when session is active
 # ---------------------------------------------------------------------------
@@ -437,6 +449,45 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
             f"/{command_name} acknowledgement claimed the final-response slot "
             f"in {surface}"
         )
+
+    @pytest.mark.parametrize("command_name", BUZZ_GATEWAY_COMMAND_NAMES)
+    @pytest.mark.asyncio
+    async def test_new_stream_thread_command_inherits_active_channel_turn(
+        self, command_name
+    ):
+        """A reply-created thread must still command its active root turn."""
+        root_id = "c" * 64
+        event = _make_buzz_event(
+            f"/{command_name} regression payload",
+            thread_id=root_id,
+            message_id="command-reply-created-thread",
+        )
+        adapter = _make_adapter(Platform("buzz"))
+        parent_session_key = _buzz_channel_session_key()
+        adapter._active_sessions[parent_session_key] = asyncio.Event()
+        adapter._dispatch_active_session_command = AsyncMock()
+
+        await adapter.handle_message(event)
+
+        assert parent_session_key not in adapter._pending_messages, (
+            f"/{command_name} was queued instead of controlling the active "
+            "channel-initiated turn"
+        )
+        if is_interrupt_then_dispatch(command_name):
+            adapter._dispatch_active_session_command.assert_awaited_once_with(
+                event, parent_session_key, command_name
+            )
+            return
+
+        assert adapter.sent_requests, (
+            f"/{command_name} produced no visible response in a reply-created "
+            "stream thread"
+        )
+        request = adapter.sent_requests[-1]
+        assert request["reply_to"] == "command-reply-created-thread"
+        assert request["metadata"]["thread_id"] == root_id
+        assert request["metadata"]["notify"] is True
+        assert request["metadata"]["_interim_send"] is True
 
 
 # ---------------------------------------------------------------------------
