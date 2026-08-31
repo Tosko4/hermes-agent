@@ -116,6 +116,45 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
 
 
 @pytest.mark.asyncio
+async def test_buzz_reply_created_thread_steers_inherited_channel_agent():
+    """The adapter-authenticated parent key must win over the new thread key."""
+    runner, adapter = _make_runner(_session_entry())
+    parent_source = SessionSource(
+        platform=Platform("buzz"),
+        user_id="buzz-user",
+        chat_id="buzz-channel",
+        user_name="tester",
+        chat_type="group",
+    )
+    parent_key = build_session_key(parent_source)
+    threaded_source = SessionSource(
+        platform=Platform("buzz"),
+        user_id="buzz-user",
+        chat_id="buzz-channel",
+        user_name="tester",
+        chat_type="group",
+        thread_id="c" * 64,
+    )
+    event = MessageEvent(
+        text="/steer keep the original turn",
+        source=threaded_source,
+        message_id="thread-command",
+    )
+    event._gateway_active_session_key_override = parent_key
+
+    running_agent = MagicMock()
+    running_agent.steer.return_value = True
+    runner._running_agents[parent_key] = running_agent
+
+    result = await runner._handle_message(event)
+
+    assert result == "Steering: keep the original turn"
+    running_agent.steer.assert_called_once_with("keep the original turn")
+    running_agent.interrupt.assert_not_called()
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
 async def test_steer_agent_without_steer_method_falls_back():
     """If the running agent somehow lacks the steer() method (older build,
     test stub), the handler must not explode — fall back to /queue."""

@@ -17064,7 +17064,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
+        _adapter_key_override = getattr(
+            event, "_gateway_active_session_key_override", None
+        )
+        _quick_key = (
+            _adapter_key_override
+            if (
+                isinstance(_adapter_key_override, str)
+                and _adapter_key_override
+                and event.is_command()
+            )
+            else self._session_key_for_source(source)
+        )
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
         if (
