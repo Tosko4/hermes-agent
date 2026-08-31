@@ -6276,6 +6276,11 @@ class BasePlatformAdapter(ABC):
                     parent_session_key in self._active_sessions
                     or runner_parent_active
                 ):
+                    parent_guard = self._active_sessions.get(parent_session_key)
+                    if parent_guard is not None:
+                        parent_guard._hermes_buzz_delivery_thread_id = str(
+                            event.source.thread_id
+                        )
                     logger.debug(
                         "[%s] Buzz thread command '/%s' inherits active "
                         "channel session %s",
@@ -6660,6 +6665,30 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
+                # A top-level Buzz channel turn can gain a real thread while
+                # it is running when the user replies with a slash command.
+                # The command guard records that new outer root on this
+                # turn's interrupt Event. Re-resolve only the delivery source
+                # here so the final answer follows the acknowledgement into
+                # the thread without changing the parent session identity.
+                _buzz_delivery_thread_id = getattr(
+                    interrupt_event,
+                    "_hermes_buzz_delivery_thread_id",
+                    None,
+                )
+                if (
+                    _buzz_delivery_thread_id
+                    and _platform_name(event.source.platform) == "buzz"
+                ):
+                    _delivery_source = dataclasses.replace(
+                        event.source,
+                        thread_id=str(_buzz_delivery_thread_id),
+                        prospective_thread_id=None,
+                    )
+                    _thread_metadata = _thread_metadata_for_source(
+                        _delivery_source,
+                        _reply_anchor_for_event(event),
+                    )
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)

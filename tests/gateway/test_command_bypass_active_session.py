@@ -476,6 +476,12 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         assert event._gateway_active_session_key_override == parent_session_key, (
             "GatewayRunner did not inherit the active parent session key"
         )
+        assert (
+            adapter._active_sessions[
+                parent_session_key
+            ]._hermes_buzz_delivery_thread_id
+            == root_id
+        ), "The active turn did not adopt the newly opened Buzz thread"
         if is_interrupt_then_dispatch(command_name):
             adapter._dispatch_active_session_command.assert_awaited_once_with(
                 event, parent_session_key, command_name
@@ -523,6 +529,30 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         assert adapter.sent_requests[-1]["metadata"]["thread_id"] == root_id
         assert adapter.sent_requests[-1]["metadata"]["_interim_send"] is True
         assert parent_session_key not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_inherited_stream_thread_receives_parent_turn_final(self):
+        """The active parent answer must follow its command ack into the thread."""
+        root_id = "e" * 64
+        adapter = _make_adapter(Platform("buzz"))
+        adapter.config.typing_indicator = False
+        event = _make_buzz_event(
+            "original channel turn",
+            thread_id=None,
+            message_id="original-root",
+        )
+        parent_session_key = _buzz_channel_session_key()
+        guard = asyncio.Event()
+        guard._hermes_buzz_delivery_thread_id = root_id
+        adapter._active_sessions[parent_session_key] = guard
+        adapter._session_tasks[parent_session_key] = asyncio.current_task()
+
+        await adapter._process_message_background(event, parent_session_key)
+
+        request = adapter.sent_requests[-1]
+        assert request["content"] == "handled:text:original channel turn"
+        assert request["metadata"]["thread_id"] == root_id
+        assert request["metadata"]["notify"] is True
 
 
 # ---------------------------------------------------------------------------
