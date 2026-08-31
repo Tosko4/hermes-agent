@@ -10,6 +10,11 @@ def test_buzz_orchestrate_preregisters_while_platform_stays_deferred() -> None:
     from toolsets import resolve_toolset
     from tools.registry import registry
 
+    adapter_modules_before = {
+        name
+        for name in sys.modules
+        if name.endswith("buzz.adapter") or name.endswith("buzz_platform.adapter")
+    }
     manager = PluginManager()
     manager.discover_and_load()
 
@@ -31,7 +36,13 @@ def test_buzz_orchestrate_preregisters_while_platform_stays_deferred() -> None:
                             "enabled": True,
                             "home_channel": "812dd8b8-ffd3-5619-8414-18df079fcce6",
                             "allowed_users": ["b" * 64],
-                            "routes": {"research": {}},
+                            "agents": {"Dash": "c" * 64},
+                            "routes": {
+                                "research": {
+                                    "agents": ["Dash"],
+                                    "primary_agent": "Dash",
+                                }
+                            },
                         }
                     }
                 }
@@ -43,7 +54,9 @@ def test_buzz_orchestrate_preregisters_while_platform_stays_deferred() -> None:
     finally:
         entry.check_fn.__globals__["_runtime_config"] = runtime_config
 
-    assert not any(
-        name.endswith("buzz.adapter") or name.endswith("buzz_platform.adapter")
+    adapter_modules_after = {
+        name
         for name in sys.modules
-    )
+        if name.endswith("buzz.adapter") or name.endswith("buzz_platform.adapter")
+    }
+    assert adapter_modules_after == adapter_modules_before

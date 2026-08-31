@@ -198,6 +198,102 @@ async def test_lcm_x_without_explicit_agent_routes_to_dash(configured, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_uses_connected_profile_adapter_when_turn_scope_has_no_buzz_secret(
+    configured, monkeypatch
+):
+    calls = []
+
+    class ConnectedAdapter:
+        _owner_profile = None
+        _private_key = PRIVATE_KEY
+        is_connected = True
+        _extra = _config()["gateway"]["platforms"]["buzz"]["extra"]
+        relay_url = "https://buzz.example"
+        home_channel = HOME
+        cli_path = "/runtime/buzz"
+
+    async def fake_exec(path, args, **kwargs):
+        calls.append((path, args, kwargs))
+        return (
+            0,
+            json.dumps(
+                {
+                    "event_id": RESULT_EVENT,
+                    "accepted": True,
+                    "mention_pubkeys": [SECOND_AGENT],
+                    "callback_pubkey": COORDINATOR,
+                }
+            ),
+            "",
+        )
+
+    adapter = ConnectedAdapter()
+    buzz_tools.register_orchestration_adapter(adapter)
+    monkeypatch.setattr(buzz_adapter, "_resolve_private_key", lambda _extra=None: "")
+    monkeypatch.setattr(buzz_adapter, "_resolve_cli_path", lambda _value="": "")
+    monkeypatch.setattr(buzz_adapter, "_exec_buzz", fake_exec)
+    try:
+        result = await buzz_tools.buzz_orchestrate(
+            {
+                "route": "lcm-x",
+                "title": "Gebruik verbonden transport",
+                "task": "Publiceer zonder het profielgeheime opnieuw te lezen.",
+            },
+            state=FakeState(),
+        )
+    finally:
+        buzz_tools.unregister_orchestration_adapter(adapter)
+
+    assert "Toegewezen aan: Dash" in result
+    assert len(calls) == 1
+    path, _args, kwargs = calls[0]
+    assert path == "/runtime/buzz"
+    assert kwargs["relay_url"] == "https://buzz.example"
+    assert kwargs["private_key"] == PRIVATE_KEY
+
+
+@pytest.mark.asyncio
+async def test_never_borrows_connected_adapter_from_another_profile(
+    configured, monkeypatch
+):
+    class DefaultAdapter:
+        _owner_profile = None
+        _private_key = PRIVATE_KEY
+        is_connected = True
+        _extra = _config()["gateway"]["platforms"]["buzz"]["extra"]
+        relay_url = "https://buzz.example"
+        home_channel = HOME
+        cli_path = "/runtime/buzz"
+
+    adapter = DefaultAdapter()
+    buzz_tools.register_orchestration_adapter(adapter)
+    monkeypatch.setattr(buzz_adapter, "_resolve_private_key", lambda _extra=None: "")
+    monkeypatch.setattr(buzz_adapter, "_resolve_cli_path", lambda _value="": "")
+    tokens = set_session_vars(
+        platform="buzz",
+        chat_id=HOME,
+        user_id=OWNER,
+        message_id=SOURCE_EVENT,
+        session_key="buzz:test",
+        profile="specialist",
+    )
+    try:
+        result = await buzz_tools.buzz_orchestrate(
+            {
+                "route": "lcm-x",
+                "title": "Geen credential-overname",
+                "task": "Deze profielgrens moet dicht blijven.",
+            },
+            state=FakeState(),
+        )
+    finally:
+        clear_session_vars(tokens)
+        buzz_tools.unregister_orchestration_adapter(adapter)
+
+    assert "relay, CLI, or signing identity is not configured" in result
+
+
+@pytest.mark.asyncio
 async def test_exact_retry_returns_cached_link_without_second_publish(
     configured, monkeypatch
 ):
