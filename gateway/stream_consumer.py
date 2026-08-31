@@ -407,6 +407,34 @@ class GatewayStreamConsumer:
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
 
+    def retarget_delivery(self) -> None:
+        """Start the next stream update as a fresh routed message.
+
+        The metadata object supplied at construction may be updated in place
+        when a platform acquires a thread after the turn began. An existing
+        preview cannot be moved between channel and thread by editing it, so
+        discard its mutable-message identity and let the next accumulated
+        snapshot create a fresh message under the new routing metadata.
+        """
+        self._message_id = None
+        self._message_created_ts = None
+        self._last_sent_text = ""
+        self._fallback_prefix = ""
+        self._fallback_final_send = False
+        self._fallback_preserve_partial_messages = False
+        self._edit_supported = True
+        self._already_sent = False
+        self._final_response_sent = False
+        self._final_content_delivered = False
+        self._delivered_final_text = None
+        self._turn_split_delivery = False
+        self._segment_preview_message_ids = set()
+        logger.info(
+            "Retargeting active stream to updated delivery metadata "
+            "(chat=%s)",
+            self.chat_id,
+        )
+
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
         if self._before_finalize_notified:

@@ -6281,6 +6281,29 @@ class BasePlatformAdapter(ABC):
                         parent_guard._hermes_buzz_delivery_thread_id = str(
                             event.source.thread_id
                         )
+                        delivery_state = getattr(
+                            parent_guard,
+                            "_hermes_buzz_delivery_state",
+                            None,
+                        )
+                        if isinstance(delivery_state, dict):
+                            delivery_metadata = delivery_state.get("metadata")
+                            if not isinstance(delivery_metadata, dict):
+                                delivery_metadata = {}
+                                delivery_state["metadata"] = delivery_metadata
+                            delivery_metadata["thread_id"] = str(
+                                event.source.thread_id
+                            )
+                            stream_consumer = delivery_state.get(
+                                "stream_consumer"
+                            )
+                            retarget_delivery = getattr(
+                                stream_consumer,
+                                "retarget_delivery",
+                                None,
+                            )
+                            if callable(retarget_delivery):
+                                retarget_delivery()
                     logger.debug(
                         "[%s] Buzz thread command '/%s' inherits active "
                         "channel session %s",
@@ -6522,6 +6545,32 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        # Buzz can open a real stream thread after a top-level turn has
+        # already started. Keep one mutable delivery state shared by the
+        # adapter guard, the runner, and its stream consumer. A mid-run slash
+        # command can then retarget both future stream frames and the normal
+        # final send before either transport snapshots stale channel metadata.
+        if _platform_name(event.source.platform) == "buzz":
+            delivery_state = getattr(
+                interrupt_event,
+                "_hermes_buzz_delivery_state",
+                None,
+            )
+            if not isinstance(delivery_state, dict):
+                delivery_metadata = dict(_thread_metadata or {})
+                adopted_thread_id = getattr(
+                    interrupt_event,
+                    "_hermes_buzz_delivery_thread_id",
+                    None,
+                )
+                if adopted_thread_id:
+                    delivery_metadata["thread_id"] = str(adopted_thread_id)
+                delivery_state = {
+                    "metadata": delivery_metadata,
+                    "stream_consumer": None,
+                }
+                interrupt_event._hermes_buzz_delivery_state = delivery_state
+            event.source._hermes_buzz_delivery_state = delivery_state
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
