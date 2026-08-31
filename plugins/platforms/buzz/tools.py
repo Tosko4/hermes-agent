@@ -13,6 +13,7 @@ import json
 import re
 import threading
 import time
+import weakref
 from typing import Any, Mapping
 
 from gateway.session_context import get_session_env
@@ -27,6 +28,76 @@ _MAX_TASK_CHARS = 48_000
 _MAX_AGENTS = 3
 _PENDING_TTL_SECONDS = 120
 _STATE_LOCK = threading.RLock()
+_RUNTIME_ADAPTERS: dict[str, weakref.ReferenceType[Any]] = {}
+_RUNTIME_ADAPTERS_LOCK = threading.RLock()
+
+
+def _runtime_profile_name(adapter: Any | None = None) -> str:
+    if adapter is not None:
+        profile = getattr(adapter, "_owner_profile", None)
+    else:
+        profile = get_session_env("HERMES_SESSION_PROFILE", "")
+    return str(profile or "default").strip() or "default"
+
+
+def register_orchestration_adapter(adapter: Any) -> None:
+    """Expose one connected profile-owned Buzz transport to its client tool."""
+    extra = getattr(adapter, "_extra", None)
+    orchestration = extra.get("orchestration") if isinstance(extra, Mapping) else None
+    if not isinstance(orchestration, Mapping) or orchestration.get("enabled") is not True:
+        return
+    with _RUNTIME_ADAPTERS_LOCK:
+        _RUNTIME_ADAPTERS[_runtime_profile_name(adapter)] = weakref.ref(adapter)
+
+
+def unregister_orchestration_adapter(adapter: Any) -> None:
+    """Remove an adapter only when it still owns its profile runtime slot."""
+    profile = _runtime_profile_name(adapter)
+    with _RUNTIME_ADAPTERS_LOCK:
+        reference = _RUNTIME_ADAPTERS.get(profile)
+        if reference is not None and reference() is adapter:
+            _RUNTIME_ADAPTERS.pop(profile, None)
+
+
+def _connected_orchestration_runtime(
+    config: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    """Return the current profile's already-authenticated Buzz transport.
+
+    Gateway startup resolves platform credentials inside the adapter's profile
+    secret scope. Client tools execute later under the routed agent profile,
+    which can intentionally have a different secret scope. Reuse only the
+    connected adapter owned by that exact profile and only while its host-owned
+    relay/home-channel configuration still matches the tool configuration.
+    """
+    profile = _runtime_profile_name()
+    with _RUNTIME_ADAPTERS_LOCK:
+        reference = _RUNTIME_ADAPTERS.get(profile)
+        adapter = reference() if reference is not None else None
+        if reference is not None and adapter is None:
+            _RUNTIME_ADAPTERS.pop(profile, None)
+    if adapter is None:
+        return None
+
+    extra = _buzz_extra(config)
+    orchestration = _orchestration_config(config)
+    expected_relay = str(extra.get("relay_url") or "").strip()
+    expected_home = str(orchestration.get("home_channel") or "").strip().lower()
+    adapter_relay = str(getattr(adapter, "relay_url", "") or "").strip()
+    adapter_home = str(getattr(adapter, "home_channel", "") or "").strip().lower()
+    cli_path = str(getattr(adapter, "cli_path", "") or "").strip()
+    private_key = str(getattr(adapter, "_private_key", "") or "").strip()
+    if (
+        getattr(adapter, "is_connected", False) is not True
+        or not expected_relay
+        or adapter_relay != expected_relay
+        or not expected_home
+        or adapter_home != expected_home
+        or not cli_path
+        or not private_key
+    ):
+        return None
+    return adapter_relay, cli_path, private_key
 
 
 def _runtime_config() -> dict:
@@ -390,10 +461,14 @@ async def buzz_orchestrate(args: dict, *, state=None, **_: Any) -> str:
         _resolve_private_key,
     )
 
-    extra = _buzz_extra(config)
-    relay_url = str(extra.get("relay_url") or "").strip()
-    cli_path = _resolve_cli_path(str(extra.get("cli_path") or "").strip())
-    private_key = _resolve_private_key(extra)
+    runtime = _connected_orchestration_runtime(config)
+    if runtime is not None:
+        relay_url, cli_path, private_key = runtime
+    else:
+        extra = _buzz_extra(config)
+        relay_url = str(extra.get("relay_url") or "").strip()
+        cli_path = _resolve_cli_path(str(extra.get("cli_path") or "").strip())
+        private_key = _resolve_private_key(extra)
     if not relay_url or not cli_path or not private_key:
         if state is not None:
             state.set(key, {"status": "failed", "updated_at": int(time.time())})

@@ -89,6 +89,22 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+def _register_orchestration_runtime(adapter) -> None:
+    if not __package__:
+        return
+    from .tools import register_orchestration_adapter
+
+    register_orchestration_adapter(adapter)
+
+
+def _unregister_orchestration_runtime(adapter) -> None:
+    if not __package__:
+        return
+    from .tools import unregister_orchestration_adapter
+
+    unregister_orchestration_adapter(adapter)
+
+
 logger = logging.getLogger(__name__)
 
 _LONG_MESSAGE_FILENAME = "buzz-message.md"
@@ -867,6 +883,7 @@ class BuzzAdapter(BasePlatformAdapter):
         await self._publish_presence("online")
         self._presence_task = asyncio.create_task(self._presence_loop())
         self._mark_connected()
+        _register_orchestration_runtime(self)
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
             self.relay_url,
@@ -881,6 +898,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
+        _unregister_orchestration_runtime(self)
         self._mark_disconnected()
         typing_publish_tasks = list(getattr(self, "_typing_publish_tasks", {}).values())
         for task in typing_publish_tasks:
