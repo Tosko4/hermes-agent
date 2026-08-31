@@ -75,6 +75,33 @@ class TestInitialReplyToId:
         assert edit_kwargs["message_id"] == "msg_1"
         assert edit_kwargs["chat_id"] == "chat_123"
 
+    @pytest.mark.asyncio
+    async def test_live_retarget_sends_final_as_fresh_thread_reply(self):
+        """A thread opened mid-turn must receive the streamed final."""
+        adapter = _make_adapter()
+        live_metadata = {}
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "buzz-channel",
+            metadata=live_metadata,
+            initial_reply_to_id="buzz-root",
+        )
+
+        await consumer._send_or_edit("Preview in the original channel")
+        live_metadata["thread_id"] = "buzz-root"
+        consumer.retarget_delivery()
+        await consumer._send_or_edit(
+            "Final answer in the new thread",
+            finalize=True,
+        )
+
+        assert adapter.send.call_count == 2
+        adapter.edit_message.assert_not_awaited()
+        final_kwargs = adapter.send.call_args_list[-1].kwargs
+        assert final_kwargs["reply_to"] == "buzz-root"
+        assert final_kwargs["metadata"]["thread_id"] == "buzz-root"
+        assert final_kwargs["metadata"]["notify"] is True
+
 
 class TestOverflowFirstMessage:
     """Verify thread routing is preserved when the first message overflows."""
@@ -171,4 +198,3 @@ class TestFeishuFallbackThreadRouting:
         assert receive_id_type == "thread_id", (
             f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
         )
-

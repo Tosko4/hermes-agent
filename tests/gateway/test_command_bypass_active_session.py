@@ -13,7 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -464,7 +464,14 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         )
         adapter = _make_adapter(Platform("buzz"))
         parent_session_key = _buzz_channel_session_key()
-        adapter._active_sessions[parent_session_key] = asyncio.Event()
+        parent_guard = asyncio.Event()
+        live_delivery_metadata = {}
+        stream_consumer = MagicMock()
+        parent_guard._hermes_buzz_delivery_state = {
+            "metadata": live_delivery_metadata,
+            "stream_consumer": stream_consumer,
+        }
+        adapter._active_sessions[parent_session_key] = parent_guard
         adapter._dispatch_active_session_command = AsyncMock()
 
         await adapter.handle_message(event)
@@ -482,6 +489,8 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
             ]._hermes_buzz_delivery_thread_id
             == root_id
         ), "The active turn did not adopt the newly opened Buzz thread"
+        assert live_delivery_metadata["thread_id"] == root_id
+        stream_consumer.retarget_delivery.assert_called_once_with()
         if is_interrupt_then_dispatch(command_name):
             adapter._dispatch_active_session_command.assert_awaited_once_with(
                 event, parent_session_key, command_name
@@ -553,6 +562,9 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         assert request["content"] == "handled:text:original channel turn"
         assert request["metadata"]["thread_id"] == root_id
         assert request["metadata"]["notify"] is True
+        assert event.source._hermes_buzz_delivery_state["metadata"][
+            "thread_id"
+        ] == root_id
 
 
 # ---------------------------------------------------------------------------

@@ -5542,6 +5542,15 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                     )
+                    _buzz_delivery_state = getattr(
+                        ctx.source,
+                        "_hermes_buzz_delivery_state",
+                        None,
+                    )
+                    if isinstance(_buzz_delivery_state, dict):
+                        _buzz_delivery_state["stream_consumer"] = (
+                            _stream_consumer
+                        )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
                             if ctx._run_still_current():
@@ -28965,6 +28974,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+
+        # A Buzz top-level turn can acquire a real outer thread while it is
+        # already running. BasePlatformAdapter publishes one mutable delivery
+        # state on the source before entering the runner. Give the stream
+        # consumer that exact metadata object instead of a one-time snapshot;
+        # `/steer` and other active commands can then retarget the live stream
+        # together with the eventual non-streaming final.
+        _buzz_delivery_state = getattr(
+            source,
+            "_hermes_buzz_delivery_state",
+            None,
+        )
+        if (
+            source.platform == Platform("buzz")
+            and isinstance(_buzz_delivery_state, dict)
+        ):
+            _buzz_delivery_metadata = _buzz_delivery_state.get("metadata")
+            if not isinstance(_buzz_delivery_metadata, dict):
+                _buzz_delivery_metadata = {}
+                _buzz_delivery_state["metadata"] = _buzz_delivery_metadata
+            if _status_thread_metadata:
+                _buzz_delivery_metadata.update(_status_thread_metadata)
+            _status_thread_metadata = _buzz_delivery_metadata
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
