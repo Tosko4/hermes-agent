@@ -6219,6 +6219,7 @@ class BasePlatformAdapter(ABC):
         # the bypass path and publish a real interim acknowledgement.  Normal
         # replies and already-established/titled threads retain their exact
         # thread session keys.
+        inherited_active_command_session = False
         if (
             session_key not in self._active_sessions
             and _platform_name(event.source.platform) == "buzz"
@@ -6244,9 +6245,37 @@ class BasePlatformAdapter(ABC):
                     ),
                     profile=self._session_key_profile(parent_source),
                 )
+                runner_session_key = parent_session_key
+                runner_parent_active = False
+                runner = getattr(self, "gateway_runner", None)
+                runner_key_for_source = getattr(
+                    runner, "_session_key_for_source", None
+                )
+                runner_is_session_running = getattr(
+                    runner, "_is_session_running", None
+                )
+                if callable(runner_key_for_source) and callable(
+                    runner_is_session_running
+                ):
+                    try:
+                        candidate = runner_key_for_source(parent_source)
+                        if isinstance(candidate, str) and candidate:
+                            runner_session_key = candidate
+                            runner_parent_active = bool(
+                                runner_is_session_running(candidate)
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[%s] Could not resolve Buzz parent runner session",
+                            self.name,
+                            exc_info=True,
+                        )
                 if parent_session_key in self._active_sessions:
                     self._heal_stale_session_lock(parent_session_key)
-                if parent_session_key in self._active_sessions:
+                if (
+                    parent_session_key in self._active_sessions
+                    or runner_parent_active
+                ):
                     logger.debug(
                         "[%s] Buzz thread command '/%s' inherits active "
                         "channel session %s",
@@ -6255,9 +6284,22 @@ class BasePlatformAdapter(ABC):
                         parent_session_key,
                     )
                     session_key = parent_session_key
+                    inherited_active_command_session = True
+                    # The adapter owns proof that this reply-created Buzz
+                    # thread belongs to the still-running channel turn.  Keep
+                    # the original source untouched for outbound thread
+                    # routing, but give GatewayRunner the already-authorized
+                    # parent key so its command guard steers that turn instead
+                    # of cold-starting a second thread session.
+                    event._gateway_active_session_key_override = (
+                        runner_session_key
+                    )
 
         # Check if there's already an active handler for this session
-        if session_key in self._active_sessions:
+        if (
+            session_key in self._active_sessions
+            or inherited_active_command_session
+        ):
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:

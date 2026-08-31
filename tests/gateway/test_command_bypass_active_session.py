@@ -473,6 +473,9 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
             f"/{command_name} was queued instead of controlling the active "
             "channel-initiated turn"
         )
+        assert event._gateway_active_session_key_override == parent_session_key, (
+            "GatewayRunner did not inherit the active parent session key"
+        )
         if is_interrupt_then_dispatch(command_name):
             adapter._dispatch_active_session_command.assert_awaited_once_with(
                 event, parent_session_key, command_name
@@ -488,6 +491,38 @@ class TestEveryBuzzCommandInThreadsAndForumTopics:
         assert request["metadata"]["thread_id"] == root_id
         assert request["metadata"]["notify"] is True
         assert request["metadata"]["_interim_send"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_command_uses_runner_parent_when_adapter_guard_is_absent(
+        self,
+    ):
+        """A live runner remains authoritative if its adapter guard vanished."""
+        root_id = "d" * 64
+        event = _make_buzz_event(
+            "/steer preserve the original run",
+            thread_id=root_id,
+            message_id="runner-only-command",
+        )
+        adapter = _make_adapter(Platform("buzz"))
+        parent_session_key = _buzz_channel_session_key()
+
+        class _Runner:
+            @staticmethod
+            def _session_key_for_source(_source):
+                return parent_session_key
+
+            @staticmethod
+            def _is_session_running(session_key):
+                return session_key == parent_session_key
+
+        adapter.gateway_runner = _Runner()
+
+        await adapter.handle_message(event)
+
+        assert event._gateway_active_session_key_override == parent_session_key
+        assert adapter.sent_requests[-1]["metadata"]["thread_id"] == root_id
+        assert adapter.sent_requests[-1]["metadata"]["_interim_send"] is True
+        assert parent_session_key not in adapter._pending_messages
 
 
 # ---------------------------------------------------------------------------
